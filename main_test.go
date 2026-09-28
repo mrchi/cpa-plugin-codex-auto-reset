@@ -1,0 +1,152 @@
+package main
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+func decodeResult(t *testing.T, raw []byte) json.RawMessage {
+	t.Helper()
+	var env pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatalf("decode envelope: %v (raw %s)", errUnmarshal, raw)
+	}
+	if !env.OK {
+		t.Fatalf("envelope not ok: %s", raw)
+	}
+	return env.Result
+}
+
+func TestLifecycleReturnsRegistration(t *testing.T) {
+	for _, method := range []string{pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure} {
+		t.Run(method, func(t *testing.T) {
+			fake := newFakeHost()
+			raw, errHandle := handleMethod(fake, method, lifecyclePayload(t, "enabled: true\n"))
+			if errHandle != nil {
+				t.Fatalf("handleMethod: %v", errHandle)
+			}
+
+			var result struct {
+				SchemaVersion uint32             `json:"schema_version"`
+				Metadata      pluginapi.Metadata `json:"metadata"`
+				Capabilities  map[string]any     `json:"capabilities"`
+			}
+			if errUnmarshal := json.Unmarshal(decodeResult(t, raw), &result); errUnmarshal != nil {
+				t.Fatalf("decode result: %v", errUnmarshal)
+			}
+			if result.SchemaVersion != 1 {
+				t.Errorf("schema_version = %d, want 1", result.SchemaVersion)
+			}
+			// Every one of these is required for the host to accept the plugin.
+			for name, value := range map[string]string{
+				"Name":             result.Metadata.Name,
+				"Version":          result.Metadata.Version,
+				"Author":           result.Metadata.Author,
+				"GitHubRepository": result.Metadata.GitHubRepository,
+			} {
+				if strings.TrimSpace(value) == "" {
+					t.Errorf("metadata %s is empty", name)
+				}
+			}
+			if result.Metadata.Name != pluginID {
+				t.Errorf("metadata Name = %q, want %q", result.Metadata.Name, pluginID)
+			}
+			for capability, enabled := range result.Capabilities {
+				if capability != "usage_plugin" {
+					t.Errorf("unexpected capability %q", capability)
+				}
+				if !enabled.(bool) {
+					t.Errorf("capability %q not enabled", capability)
+				}
+			}
+			if len(result.Capabilities) != 1 {
+				t.Errorf("capabilities = %v, want only usage_plugin", result.Capabilities)
+			}
+		})
+	}
+}
+
+func TestRegisterSurvivesBrokenConfig(t *testing.T) {
+	fake := newFakeHost()
+	raw, errHandle := handleMethod(fake, pluginabi.MethodPluginRegister, lifecyclePayload(t, "enabled: [broken\n"))
+	if errHandle != nil {
+		t.Fatalf("handleMethod: %v", errHandle)
+	}
+	decodeResult(t, raw)
+	if logs := fake.logged(); len(logs) != 1 || logs[0].Level != "warn" {
+		t.Fatalf("logs = %+v, want one warning", logs)
+	}
+}
+
+func TestUnknownMethodIsAnErrorEnvelope(t *testing.T) {
+	raw, errHandle := handleMethod(newFakeHost(), "plugin.quiesce", []byte("{}"))
+	if errHandle != nil {
+		t.Fatalf("handleMethod: %v", errHandle)
+	}
+	var env pluginabi.Envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		t.Fatalf("decode envelope: %v", errUnmarshal)
+	}
+	if env.OK {
+		t.Fatalf("envelope ok = true, want false (%s)", raw)
+	}
+	if env.Error == nil || env.Error.Code != "unknown_method" {
+		t.Fatalf("error = %+v, want code unknown_method", env.Error)
+	}
+}
+
+func TestShutdownSucceeds(t *testing.T) {
+	raw, errHandle := handleMethod(newFakeHost(), pluginabi.MethodPluginShutdown, nil)
+	if errHandle != nil {
+		t.Fatalf("handleMethod: %v", errHandle)
+	}
+	decodeResult(t, raw)
+}
+
+func TestUsageHandleLogsRecordWithPluginID(t *testing.T) {
+	fake := newFakeHost()
+	if _, errHandle := handleMethod(fake, pluginabi.MethodPluginRegister, lifecyclePayload(t, "enabled: false\n")); errHandle != nil {
+		t.Fatalf("register: %v", errHandle)
+	}
+	record, errMarshal := json.Marshal(pluginapi.UsageRecord{
+		Provider:  "codex",
+		AuthID:    "codex-a@example.com.json",
+		AuthIndex: "c1f0a9",
+		AuthType:  "oauth",
+		Failed:    true,
+		Failure:   pluginapi.UsageFailure{StatusCode: 429, Body: `{"error":{"type":"usage_limit_reached"}}`},
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal record: %v", errMarshal)
+	}
+
+	raw, errHandle := handleMethod(fake, pluginabi.MethodUsageHandle, record)
+	if errHandle != nil {
+		t.Fatalf("usage.handle: %v", errHandle)
+	}
+	if string(decodeResult(t, raw)) != "{}" {
+		t.Fatalf("result = %s, want {}", decodeResult(t, raw))
+	}
+
+	logs := fake.logged()
+	if len(logs) != 1 {
+		t.Fatalf("logs = %+v, want exactly one record", logs)
+	}
+	fields := logs[0].Fields
+	if fields["plugin"] != pluginID {
+		t.Errorf("field plugin = %v, want %q", fields["plugin"], pluginID)
+	}
+	if fields["provider"] != "codex" || fields["auth_id"] != "codex-a@example.com.json" {
+		t.Errorf("fields = %v, want provider and auth_id of the record", fields)
+	}
+	if fields["status_code"] != 429 {
+		t.Errorf("field status_code = %v, want 429", fields["status_code"])
+	}
+	if fields["enabled"] != false {
+		t.Errorf("field enabled = %v, want false from the registered config", fields["enabled"])
+	}
+}
