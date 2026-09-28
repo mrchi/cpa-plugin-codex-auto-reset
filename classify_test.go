@@ -3,8 +3,8 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -23,31 +23,58 @@ func usageRecord(body string) pluginapi.UsageRecord {
 	return pluginapi.UsageRecord{
 		Provider:  "codex",
 		AuthType:  "oauth",
-		AuthID:    "codex-a@example.com.json",
-		AuthIndex: "c1f0a9",
+		AuthID:    authFile,
+		AuthIndex: authIndex,
 		Model:     "gpt-5.5",
 		Failed:    true,
 		Failure:   pluginapi.UsageFailure{StatusCode: 429, Body: body},
 	}
 }
 
+func marshalRecord(t *testing.T, record pluginapi.UsageRecord) []byte {
+	t.Helper()
+	raw, errMarshal := json.Marshal(record)
+	if errMarshal != nil {
+		t.Fatalf("marshal record: %v", errMarshal)
+	}
+	return raw
+}
+
 func TestUsageHandleClassifiesExhaustion(t *testing.T) {
-	weeklyBody := quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000`)
+	weeklyBody := hitBody()
 	weeklyFallbackBody := quotaBody(true, `"type":"usage_limit_reached","resets_in_seconds":200000`)
+	// resetsAtBody renders a body whose only timing is the timestamp; the offset is
+	// applied to the case's own clock.
+	resetsAt := func(offset time.Duration) func(time.Time) string {
+		return func(at time.Time) string { return resetsAtBody(at.Add(offset)) }
+	}
+	bothFields := func(offset time.Duration) func(time.Time) string {
+		return func(at time.Time) string {
+			return weeklyBodyWith(`"resets_in_seconds":200000,"resets_at":"` + at.Add(offset).Format(time.RFC3339) + `"`)
+		}
+	}
 
 	tests := []struct {
 		name       string
 		configYAML string
 		record     pluginapi.UsageRecord
-		wantLevel  string // "" means the record is ignored with no log at all
-		wantReason string
+		// bodyAt replaces the record body with one built from the case's clock, for
+		// the resets_at cases whose timestamp must sit relative to "now".
+		bodyAt func(at time.Time) string
+		// wantLevel is "" when the record is ignored with no log at all.
+		wantLevel        string
+		wantReason       string
+		wantWindow       string
+		wantResetsInSecs int64 // 0 means the case does not pin the number
 	}{
 		{
-			name:       "weekly window exhaustion is a hit",
-			configYAML: "enabled: true\n",
-			record:     usageRecord(weeklyBody),
-			wantLevel:  "info",
-			wantReason: reasonHit,
+			name:             "weekly window exhaustion is a hit",
+			configYAML:       "enabled: true\n",
+			record:           usageRecord(weeklyBody),
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
 		},
 		{
 			name:       "top-level error object is a hit",
@@ -55,13 +82,60 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(false, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000`)),
 			wantLevel:  "info",
 			wantReason: reasonHit,
+			wantWindow: windowWeekly,
 		},
 		{
-			name:       "missing limit_window_minutes falls back to resets_in_seconds",
+			name:             "missing limit_window_minutes falls back to resets_in_seconds",
+			configYAML:       "enabled: true\n",
+			record:           usageRecord(weeklyFallbackBody),
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
+		},
+		{
+			name:             "resets_at alone still classifies as a hit",
+			configYAML:       "enabled: true\n",
+			record:           usageRecord(resetsAtBody(testClock.Add(200000 * time.Second))),
+			bodyAt:           resetsAt(200000 * time.Second),
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
+		},
+		{
+			name:       "resets_at alone drives the weekly fallback window",
 			configYAML: "enabled: true\n",
-			record:     usageRecord(weeklyFallbackBody),
-			wantLevel:  "info",
-			wantReason: reasonHit,
+			record:     usageRecord(timingOnlyBody(`"resets_in_seconds":200000`)),
+			bodyAt: func(at time.Time) string {
+				return timingOnlyBody(`"resets_at":"` + at.Add(200000*time.Second).Format(time.RFC3339) + `"`)
+			},
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
+		},
+		{
+			name:       "a non-positive resets_in_seconds falls back to resets_at",
+			configYAML: "enabled: true\n",
+			record:     usageRecord(weeklyBodyWith(`"resets_in_seconds":-1`)),
+			bodyAt: func(at time.Time) string {
+				return weeklyBodyWith(`"resets_in_seconds":-1,"resets_at":"` + at.Add(200000*time.Second).Format(time.RFC3339) + `"`)
+			},
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
+		},
+		{
+			name:             "resets_in_seconds wins when both are present",
+			configYAML:       "enabled: true\n",
+			record:           usageRecord(weeklyBody),
+			bodyAt:           bothFields(3600 * time.Second),
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
 		},
 		{
 			name:       "reset exactly one day out is not a hit",
@@ -69,6 +143,17 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":86400`)),
 			wantLevel:  "debug",
 			wantReason: reasonWithinDay,
+			wantWindow: windowWeekly,
+		},
+		{
+			name:             "resets_at inside the one-day guard is not a hit",
+			configYAML:       "enabled: true\n",
+			record:           usageRecord(resetsAtBody(testClock.Add(time.Hour))),
+			bodyAt:           resetsAt(time.Hour),
+			wantLevel:        "debug",
+			wantReason:       reasonWithinDay,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 3600,
 		},
 		{
 			name:       "reset just past one day is a hit",
@@ -76,6 +161,16 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":86401`)),
 			wantLevel:  "info",
 			wantReason: reasonHit,
+			wantWindow: windowWeekly,
+		},
+		{
+			name:       "a resets_at already in the past is not a hit",
+			configYAML: "enabled: true\n",
+			record:     usageRecord(resetsAtBody(testClock.Add(-time.Hour))),
+			bodyAt:     resetsAt(-time.Hour),
+			wantLevel:  "debug",
+			wantReason: reasonUnknownWindow,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "5-hour window is not a hit",
@@ -83,6 +178,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":300,"resets_in_seconds":3600`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
+			wantWindow: windowFiveHour,
 		},
 		{
 			name:       "fallback range without limit_window_minutes is not a hit",
@@ -90,6 +186,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","resets_in_seconds":3600`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
+			wantWindow: windowFiveHour,
 		},
 		{
 			name:       "fallback boundary 18000 is not weekly",
@@ -97,6 +194,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","resets_in_seconds":18000`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
+			wantWindow: windowFiveHour,
 		},
 		{
 			name:       "weekly window without reset timing is not a hit",
@@ -104,6 +202,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "no window and no reset timing is not a hit",
@@ -111,6 +210,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached"`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
+			wantWindow: windowUnknown,
 		},
 		{
 			name:       "non-positive reset is not a hit",
@@ -118,6 +218,15 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":-1`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
+			wantWindow: windowWeekly,
+		},
+		{
+			name:       "an unparseable resets_at is not a hit",
+			configYAML: "enabled: true\n",
+			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_at":"soon"`)),
+			wantLevel:  "debug",
+			wantReason: reasonUnknownWindow,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "disabled plugin ignores exhaustion",
@@ -125,6 +234,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(weeklyBody),
 			wantLevel:  "debug",
 			wantReason: reasonDisabled,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "excluded by auth id",
@@ -132,6 +242,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(weeklyBody),
 			wantLevel:  "debug",
 			wantReason: reasonExcluded,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "excluded by auth file name",
@@ -143,6 +254,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			}(),
 			wantLevel:  "debug",
 			wantReason: reasonExcluded,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "excluded by auth index",
@@ -150,6 +262,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(weeklyBody),
 			wantLevel:  "debug",
 			wantReason: reasonExcluded,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "blank exclude entry never matches",
@@ -157,6 +270,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(weeklyBody),
 			wantLevel:  "info",
 			wantReason: reasonHit,
+			wantWindow: windowWeekly,
 		},
 		{
 			name:       "non-codex provider is ignored",
@@ -213,74 +327,66 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			clock := useFakeClock(t, testClock)
 			fake := newFakeHost()
-			if _, errRegister := handleMethod(fake, pluginabi.MethodPluginRegister, lifecyclePayload(t, test.configYAML)); errRegister != nil {
-				t.Fatalf("register: %v", errRegister)
-			}
-			fake.logs = nil
-			// A fresh debounce state per case: a hit dispatches the reset flow (ticket
-			// 03), and a flow still running from a previous case must not suppress this
-			// case's signal.
-			activeReset = newResetState()
+			registerConfig(t, fake, test.configYAML)
+			fake.clearLogs()
 
-			raw, errHandle := handleMethod(fake, pluginabi.MethodUsageHandle, marshalRecord(t, test.record))
-			if errHandle != nil {
-				t.Fatalf("usage.handle: %v", errHandle)
+			record := test.record
+			if test.bodyAt != nil {
+				record.Failure.Body = test.bodyAt(clock.now())
 			}
-			if result := string(decodeResult(t, raw)); result != "{}" {
-				t.Errorf("result = %s, want {}", result)
-			}
+			sendUsage(t, fake, record)
 
 			logs := fake.logged()
 			if test.wantLevel == "" {
 				if len(logs) != 0 {
 					t.Fatalf("logs = %+v, want the record ignored without logging", logs)
 				}
-			} else {
-				// A hit also produces reset-flow logs on the dispatched goroutine, so
-				// the verdict is the record carrying the expected reason.
-				matched := logsWithMessage(logs, test.wantReason)
-				if len(matched) != 1 {
-					t.Fatalf("logs with reason %q = %+v, want exactly one (all logs: %+v)", test.wantReason, matched, logs)
-				}
-				if matched[0].Level != test.wantLevel {
-					t.Errorf("level = %q, want %q", matched[0].Level, test.wantLevel)
-				}
-				for _, field := range []string{"plugin", "auth_id", "auth_index", "model", "resets_in_seconds", "window"} {
-					if _, okField := matched[0].Fields[field]; !okField {
-						t.Errorf("field %q missing from %v", field, matched[0].Fields)
-					}
-				}
-				if matched[0].Fields["plugin"] != pluginID {
-					t.Errorf("field plugin = %v, want %q", matched[0].Fields["plugin"], pluginID)
-				}
-			}
-
-			if test.wantReason == reasonHit {
-				// A hit hands the record to the reset flow on its own goroutine; what
-				// that flow does is ticket 03's subject.
-				waitFor(t, func() bool { return len(fake.authGetCalls()) == 1 })
-				if calls := fake.requests(); len(calls) != 0 {
-					t.Errorf("http.do calls = %+v, want none", calls)
+				if got := fake.authGetCalls(); len(got) != 0 {
+					t.Errorf("auth.get calls = %v, want none", got)
 				}
 				return
 			}
-			// Records that do not hit are observation only: no reset work happens.
-			if calls := fake.authGetCalls(); len(calls) != 0 {
-				t.Errorf("auth.get calls = %v, want none", calls)
+			// A hit also produces reset-flow logs on the dispatched goroutine, so the
+			// verdict is the record carrying the expected reason.
+			matched := logsWithMessage(logs, test.wantReason)
+			if len(matched) != 1 {
+				t.Fatalf("logs with reason %q = %+v, want exactly one (all logs: %+v)", test.wantReason, matched, logs)
 			}
-			if calls := fake.requests(); len(calls) != 0 {
-				t.Errorf("http.do calls = %+v, want none", calls)
+			entry := matched[0]
+			if entry.Level != test.wantLevel {
+				t.Errorf("level = %q, want %q", entry.Level, test.wantLevel)
+			}
+			for _, field := range []string{"plugin", "auth_id", "auth_index", "model", "resets_in_seconds", "window"} {
+				if _, okField := entry.Fields[field]; !okField {
+					t.Errorf("field %q missing from %v", field, entry.Fields)
+				}
+			}
+			if entry.Fields["plugin"] != pluginID {
+				t.Errorf("field plugin = %v, want %q", entry.Fields["plugin"], pluginID)
+			}
+			if test.wantWindow != "" && entry.Fields["window"] != test.wantWindow {
+				t.Errorf("field window = %v, want %q", entry.Fields["window"], test.wantWindow)
+			}
+			if test.wantResetsInSecs != 0 && entry.Fields["resets_in_seconds"] != test.wantResetsInSecs {
+				t.Errorf("field resets_in_seconds = %v, want %d", entry.Fields["resets_in_seconds"], test.wantResetsInSecs)
+			}
+
+			if test.wantReason == reasonHit {
+				// A hit hands the record to the reset flow on its own goroutine; with no
+				// credential stored the flow stops right there. Waiting for its line is
+				// what keeps the case deterministic.
+				waitForLog(t, fake, reasonAuthUnreadable)
+			}
+			if got := fake.requestCount(); got != 0 {
+				t.Errorf("http.do calls = %d, want none", got)
+			}
+			if test.wantReason != reasonHit {
+				if got := fake.authGetCalls(); len(got) != 0 {
+					t.Errorf("auth.get calls = %v, want none", got)
+				}
 			}
 		})
 	}
-}
-
-func marshalRecord(t *testing.T, record pluginapi.UsageRecord) []byte {
-	t.Helper()
-	raw, errMarshal := json.Marshal(record)
-	if errMarshal != nil {
-		t.Fatalf("marshal record: %v", errMarshal)
-	}
-	return raw
 }

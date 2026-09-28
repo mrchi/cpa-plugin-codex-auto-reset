@@ -39,7 +39,8 @@ const (
 // Reset-flow log messages, one per outcome, so credit consumption stays auditable
 // after the fact (spec story 17).
 const (
-	reasonResetDropped       = "auto-reset: reset already in flight or suppressed: signal dropped"
+	reasonResetInFlight      = "auto-reset: reset already in flight: signal dropped"
+	reasonResetSuppressed    = "auto-reset: credential suppressed after a recent reset: signal dropped"
 	reasonAuthUnreadable     = "auto-reset: cannot read credential: no reset"
 	reasonNoAccessToken      = "auto-reset: credential carries no access token: no reset"
 	reasonUUIDFailed         = "auto-reset: cannot generate an idempotency key: no reset"
@@ -82,8 +83,8 @@ type managementResetQuotaRequest struct {
 // (D11); a signal arriving while a flow is running or inside the suppression window
 // is dropped with a debug log rather than queued (D12).
 func startReset(state *resetState, h host, cfg pluginConfig, record pluginapi.UsageRecord) {
-	if !state.begin(record.AuthIndex) {
-		h.log("debug", reasonResetDropped, logFields(resetFields(record, nil)))
+	if claimed, reason := state.begin(record.AuthIndex); !claimed {
+		h.log("debug", reason, logFields(resetFields(record, nil)))
 		return
 	}
 	// The goroutine captures this state, so a later reconfigure or test cannot
@@ -169,12 +170,14 @@ func fetchResetCredit(h host, creds authCredentials, record pluginapi.UsageRecor
 
 // consumeResetCredit redeems one credit by id. Only reset and already_redeemed mean
 // the credit is gone; nothing_to_reset, no_credit (both HTTP 200), any other code and
-// every non-2xx status are failures that consumed nothing (D17).
+// every non-2xx status are failures that consumed nothing (D17). Each branch adds its
+// own detail to the local field set and returns, so the set is never shared.
 func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string, record pluginapi.UsageRecord) (string, bool) {
 	fields := map[string]any{"credit_id": creditID, "redeem_request_id": redeemID}
 	body, errMarshal := json.Marshal(consumeRequest{RedeemRequestID: redeemID, CreditID: creditID})
 	if errMarshal != nil {
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, withField(fields, "error", errMarshal.Error()))))
+		fields["error"] = errMarshal.Error()
+		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
 	}
 	response, errDo := h.httpDo(httpRequest{
@@ -184,23 +187,27 @@ func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string
 		Body:    body,
 	})
 	if errDo != nil {
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, withField(fields, "error", errDo.Error()))))
+		fields["error"] = errDo.Error()
+		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, withField(fields, "status_code", response.StatusCode))))
+		fields["status_code"] = response.StatusCode
+		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
 	}
 	var result consumeResponse
 	if errUnmarshal := json.Unmarshal(response.Body, &result); errUnmarshal != nil {
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, withField(fields, "error", errUnmarshal.Error()))))
+		fields["error"] = errUnmarshal.Error()
+		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
 	}
 	switch result.Code {
 	case consumeCodeReset, consumeCodeAlreadyRedeemed:
 		return result.Code, true
 	default:
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, withField(fields, "code", result.Code))))
+		fields["code"] = result.Code
+		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
 	}
 }
@@ -238,10 +245,13 @@ func clearCooldown(h host, cfg pluginConfig, record pluginapi.UsageRecord) {
 	h.log("info", reasonCooldownCleared, logFields(resetFields(record, nil)))
 }
 
-// pickCredit returns the available credit closest to expiry. A null (or unparseable)
-// expires_at means "never expires" and always ranks last (D16). Credits are spent
-// before their 30-day expiry rather than hoarded (spec story 7).
+// pickCredit returns the available credit closest to expiry. A credit that has already
+// expired is skipped: consuming it would only earn a no_credit, which would abandon
+// the flow while a usable credit sits next to it. A null (or unparseable) expires_at
+// means "never expires" and always ranks last (D16). Credits are spent before their
+// 30-day expiry rather than hoarded (spec story 7).
 func pickCredit(credits []resetCredit) (resetCredit, bool) {
+	at := now()
 	var chosen resetCredit
 	var chosenExpiry time.Time
 	chosenDated, found := false, false
@@ -251,6 +261,9 @@ func pickCredit(credits []resetCredit) (resetCredit, bool) {
 		}
 		expiry, errParse := time.Parse(time.RFC3339, credit.ExpiresAt)
 		dated := errParse == nil
+		if dated && !expiry.After(at) {
+			continue
+		}
 		if !found || earlier(expiry, dated, chosenExpiry, chosenDated) {
 			chosen, chosenExpiry, chosenDated, found = credit, expiry, dated, true
 		}
@@ -371,16 +384,5 @@ func resetFields(record pluginapi.UsageRecord, extra map[string]any) map[string]
 	for key, value := range extra {
 		fields[key] = value
 	}
-	return fields
-}
-
-// withField copies base and adds one entry, so a shared field set can be extended
-// without being mutated.
-func withField(base map[string]any, key string, value any) map[string]any {
-	fields := make(map[string]any, len(base)+1)
-	for existing, existingValue := range base {
-		fields[existing] = existingValue
-	}
-	fields[key] = value
 	return fields
 }

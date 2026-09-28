@@ -15,7 +15,6 @@ type host interface {
 	// any other value, "debug" included, lands at debug level (D13).
 	log(level, message string, fields map[string]any)
 	authGet(authIndex string) (pluginapi.HostAuthGetResponse, error)
-	authList() ([]pluginapi.HostAuthFileEntry, error)
 	httpDo(req httpRequest) (pluginapi.HTTPResponse, error)
 }
 
@@ -53,16 +52,6 @@ func (cgoHost) authGet(authIndex string) (pluginapi.HostAuthGetResponse, error) 
 	}
 	errCall := callHost(pluginabi.MethodHostAuthGet, payload, &response)
 	return response, errCall
-}
-
-func (cgoHost) authList() ([]pluginapi.HostAuthFileEntry, error) {
-	var response struct {
-		Files []pluginapi.HostAuthFileEntry `json:"files"`
-	}
-	if errCall := callHost(pluginabi.MethodHostAuthList, []byte("{}"), &response); errCall != nil {
-		return nil, errCall
-	}
-	return response.Files, nil
 }
 
 // httpDo performs the request through the host transport. There is no timeout field

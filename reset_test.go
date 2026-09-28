@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,34 +20,21 @@ import (
 var errFakeTransport = errors.New("fake transport failure")
 
 const (
+	authIndex   = "c1f0a9"
+	authFile    = "codex-a@example.com.json"
+	accessToken = "tok-123"
+	accountID   = "acct-123"
+
 	creditsURL = codexBaseURL + resetCreditsPath
 	consumeURL = codexBaseURL + resetConsumePath
 	quotaURL   = defaultManagementBaseURL + managementResetQuotaPath
+
+	managementConfigYAML = "enabled: true\nmanagement_key: secret-key\n"
 )
 
-// waitFor polls a condition until it holds. The reset flow runs on its own
-// goroutine, so tests wait on an observable host-call effect rather than sleeping a
-// fixed amount.
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("condition not met within 2s")
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func logsWithMessage(logs []fakeLog, message string) []fakeLog {
-	var matched []fakeLog
-	for _, entry := range logs {
-		if entry.Message == message {
-			matched = append(matched, entry)
-		}
-	}
-	return matched
-}
+// aUsableCredit is the credit listing most cases start from: it expires well after
+// testClock, so it is never skipped as expired.
+const aUsableCredit = `{"id":"credit-1","status":"available","expires_at":"2026-07-17T00:00:00Z"}`
 
 var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
@@ -57,35 +45,65 @@ func assertHeader(t *testing.T, request httpRequest, name, want string) {
 	}
 }
 
-// hitBody is the weekly-exhaustion error body that makes classify() report a hit.
-func hitBody() string {
-	return quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000`)
-}
-
-func resetConfig(managementKey string) pluginConfig {
-	cfg := defaultConfig()
-	cfg.ManagementKey = managementKey
-	return cfg
-}
-
 // creditsBody renders an upstream credits listing; unknown top-level fields are part
 // of the real payload and must be ignored.
 func creditsBody(credits string) string {
 	return `{"credits":[` + credits + `],"available_count":9,"total_earned_count":9}`
 }
 
-// scriptedResetHost returns a fake with the credential, credit listing, consume and
-// cooldown-clear responses a happy flow needs; callers override individual routes.
+// scriptedResetHost is a fake host wired for one credential and a flow that can
+// succeed: an available credit, a consume answer and a cooldown-clear answer.
 func scriptedResetHost(credits string, consumeStatus int, consumeCode string) *fakeHost {
-	fake := newFakeHost(
-		fakeHTTPRoute{Method: http.MethodGet, URL: creditsURL, Status: 200, Body: creditsBody(credits)},
-		fakeHTTPRoute{Method: http.MethodPost, URL: consumeURL, Status: consumeStatus, Body: `{"code":"` + consumeCode + `"}`},
-		fakeHTTPRoute{Method: http.MethodPost, URL: quotaURL, Status: 200, Body: `{"status":"ok"}`},
-	)
-	fake.auths["c1f0a9"] = pluginapi.HostAuthGetResponse{JSON: json.RawMessage(`{"access_token":"tok-123","account_id":"acct-123"}`)}
-	return fake
+	return newFakeHost().
+		withCredential(authIndex, `{"access_token":"`+accessToken+`","account_id":"`+accountID+`"}`).
+		script(http.MethodGet, creditsURL, http.StatusOK, creditsBody(credits)).
+		script(http.MethodPost, consumeURL, consumeStatus, `{"code":"`+consumeCode+`"}`).
+		script(http.MethodPost, quotaURL, http.StatusOK, `{"status":"ok"}`)
 }
 
+// driveHit registers the configuration, sends one exhaustioned signal, and waits for
+// the log line that ends the flow. The flow runs on its own goroutine (D11), so this
+// is what makes the assertions after it deterministic.
+func driveHit(t *testing.T, fake *fakeHost, configYAML, lastLog string, record pluginapi.UsageRecord) {
+	t.Helper()
+	registerConfig(t, fake, configYAML)
+	sendUsage(t, fake, record)
+	waitForLog(t, fake, lastLog)
+}
+
+// consumedCredit decodes the single consume request a flow sent and returns its body.
+func consumedCredit(t *testing.T, fake *fakeHost) consumeRequest {
+	t.Helper()
+	requests := fake.requestsFor(http.MethodPost, consumeURL)
+	if len(requests) != 1 {
+		t.Fatalf("consume requests = %d, want exactly one", len(requests))
+	}
+	var redeem consumeRequest
+	if errUnmarshal := json.Unmarshal(requests[0].Body, &redeem); errUnmarshal != nil {
+		t.Fatalf("decode consume body %s: %v", requests[0].Body, errUnmarshal)
+	}
+	if !uuidV4Pattern.MatchString(redeem.RedeemRequestID) {
+		t.Errorf("redeem_request_id = %q, want a UUID v4", redeem.RedeemRequestID)
+	}
+	return redeem
+}
+
+// waitForSuppressed probes the credential until the debounce reports the suppression
+// window (spec story 14). Probes are dropped without any host call, and a drop
+// reported as in-flight means the flow has not released its slot yet — so this is also
+// how a test observes that a credited flow finished.
+func waitForSuppressed(t *testing.T, fake *fakeHost, record pluginapi.UsageRecord) {
+	t.Helper()
+	waitFor(t, func() bool {
+		if len(logsWithMessage(fake.logged(), reasonResetSuppressed)) > 0 {
+			return true
+		}
+		sendUsage(t, fake, record)
+		return false
+	})
+}
+
+// jwtWithAccountID builds an unsigned id_token carrying the account id claim.
 func jwtWithAccountID(t *testing.T, accountID string) string {
 	t.Helper()
 	payload, errMarshal := json.Marshal(map[string]any{
@@ -99,18 +117,19 @@ func jwtWithAccountID(t *testing.T, accountID string) string {
 }
 
 func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
+	useFakeClock(t, testClock)
 	fake := scriptedResetHost(`
 		{"id":"later","status":"available","expires_at":"2026-08-01T00:00:00Z"},
-		{"id":"redeemed","status":"redeemed","expires_at":"2026-06-01T00:00:00Z"},
-		{"id":"earliest","status":"available","expires_at":"2026-07-01T00:00:00Z"},
+		{"id":"redeemed","status":"redeemed","expires_at":"2026-07-02T00:00:00Z"},
+		{"id":"earliest","status":"available","expires_at":"2026-07-05T00:00:00Z"},
 		{"id":"forever","status":"available","expires_at":null}`, http.StatusOK, consumeCodeReset)
 
-	if !runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())) {
-		t.Fatalf("runReset = false, want a consumed credit")
-	}
+	driveHit(t, fake, managementConfigYAML, reasonCooldownCleared, hitRecord())
 
+	// The whole flow, in order: read the credential, list the credits, consume one,
+	// clear CPA's cooldown.
 	want := []string{
-		"auth.get c1f0a9",
+		"auth.get " + authIndex,
 		"http.do GET " + creditsURL,
 		"http.do POST " + consumeURL,
 		"http.do POST " + quotaURL,
@@ -119,34 +138,34 @@ func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
 		t.Fatalf("call trace = %v, want %v", trace, want)
 	}
 
-	requests := fake.requests()
-	get, consume, quota := requests[0], requests[1], requests[2]
-	assertHeader(t, get, "Authorization", "Bearer tok-123")
-	assertHeader(t, get, "ChatGPT-Account-ID", "acct-123")
-	assertHeader(t, get, "User-Agent", codexUserAgent)
-	assertHeader(t, get, "originator", codexOriginator)
-	if contentType := get.Headers.Get("Content-Type"); contentType != "" {
+	listing := fake.requestsFor(http.MethodGet, creditsURL)
+	if len(listing) != 1 {
+		t.Fatalf("listing requests = %d, want one", len(listing))
+	}
+	assertHeader(t, listing[0], "Authorization", "Bearer "+accessToken)
+	assertHeader(t, listing[0], "ChatGPT-Account-ID", accountID)
+	assertHeader(t, listing[0], "User-Agent", codexUserAgent)
+	assertHeader(t, listing[0], "originator", codexOriginator)
+	if contentType := listing[0].Headers.Get("Content-Type"); contentType != "" {
 		t.Errorf("GET Content-Type = %q, want none", contentType)
 	}
 
-	assertHeader(t, consume, "Content-Type", "application/json")
-	var redeem consumeRequest
-	if errUnmarshal := json.Unmarshal(consume.Body, &redeem); errUnmarshal != nil {
-		t.Fatalf("decode consume body %s: %v", consume.Body, errUnmarshal)
-	}
+	redeem := consumedCredit(t, fake)
 	if redeem.CreditID != "earliest" {
 		t.Errorf("consume credit_id = %q, want the earliest-expiring available credit", redeem.CreditID)
 	}
-	if !uuidV4Pattern.MatchString(redeem.RedeemRequestID) {
-		t.Errorf("redeem_request_id = %q, want a UUID v4", redeem.RedeemRequestID)
-	}
 
-	assertHeader(t, quota, "Authorization", "Bearer secret-key")
-	var resetQuota managementResetQuotaRequest
-	if errUnmarshal := json.Unmarshal(quota.Body, &resetQuota); errUnmarshal != nil {
-		t.Fatalf("decode reset-quota body %s: %v", quota.Body, errUnmarshal)
+	quota := fake.requestsFor(http.MethodPost, quotaURL)
+	if len(quota) != 1 {
+		t.Fatalf("cooldown-clear requests = %d, want one", len(quota))
 	}
-	if resetQuota.AuthIndex != "c1f0a9" {
+	assertHeader(t, quota[0], "Authorization", "Bearer secret-key")
+	assertHeader(t, quota[0], "Content-Type", "application/json")
+	var resetQuota managementResetQuotaRequest
+	if errUnmarshal := json.Unmarshal(quota[0].Body, &resetQuota); errUnmarshal != nil {
+		t.Fatalf("decode reset-quota body %s: %v", quota[0].Body, errUnmarshal)
+	}
+	if resetQuota.AuthIndex != authIndex {
 		t.Errorf("reset-quota auth_index = %q, want the runtime auth index", resetQuota.AuthIndex)
 	}
 
@@ -165,6 +184,9 @@ func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
 	}
 }
 
+// TestResetCreditSelection pins which credit the flow spends. Expired and unusable
+// entries must not cost the flow its only chance: a consume that comes back no_credit
+// abandons the reset while a usable credit sits next to it.
 func TestResetCreditSelection(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -173,12 +195,31 @@ func TestResetCreditSelection(t *testing.T) {
 	}{
 		{
 			name:       "earliest expires_at wins",
-			credits:    `{"id":"later","status":"available","expires_at":"2026-08-01T00:00:00Z"},{"id":"earliest","status":"available","expires_at":"2026-07-01T00:00:00Z"}`,
+			credits:    `{"id":"later","status":"available","expires_at":"2026-08-01T00:00:00Z"},{"id":"earliest","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
 			wantCredit: "earliest",
 		},
 		{
+			name:       "an expired credit is skipped",
+			credits:    `{"id":"expired","status":"available","expires_at":"2026-06-01T00:00:00Z"},{"id":"usable","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
+			wantCredit: "usable",
+		},
+		{
+			name:    "only expired credits consume nothing",
+			credits: `{"id":"expired-soonest","status":"available","expires_at":"2026-06-30T00:00:00Z"},{"id":"expired-later","status":"available","expires_at":"2026-07-01T11:59:59Z"}`,
+		},
+		{
+			name:       "a credit expiring exactly now is skipped",
+			credits:    `{"id":"boundary","status":"available","expires_at":"2026-07-01T12:00:00Z"},{"id":"usable","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
+			wantCredit: "usable",
+		},
+		{
+			name:       "an expired credit never wins over an undated one",
+			credits:    `{"id":"expired","status":"available","expires_at":"2026-06-01T00:00:00Z"},{"id":"forever","status":"available","expires_at":null}`,
+			wantCredit: "forever",
+		},
+		{
 			name:       "null expires_at ranks last",
-			credits:    `{"id":"forever","status":"available","expires_at":null},{"id":"dated","status":"available","expires_at":"2026-09-01T00:00:00Z"}`,
+			credits:    `{"id":"forever","status":"available","expires_at":null},{"id":"dated","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
 			wantCredit: "dated",
 		},
 		{
@@ -188,16 +229,16 @@ func TestResetCreditSelection(t *testing.T) {
 		},
 		{
 			name:       "unparseable expiry ranks last",
-			credits:    `{"id":"broken","status":"available","expires_at":"tomorrow"},{"id":"dated","status":"available","expires_at":"2026-09-01T00:00:00Z"}`,
+			credits:    `{"id":"broken","status":"available","expires_at":"tomorrow"},{"id":"dated","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
 			wantCredit: "dated",
 		},
 		{
 			name:    "non-available credits are skipped",
-			credits: `{"id":"redeeming","status":"redeeming","expires_at":"2026-07-01T00:00:00Z"},{"id":"redeemed","status":"redeemed","expires_at":"2026-07-01T00:00:00Z"}`,
+			credits: `{"id":"redeeming","status":"redeeming","expires_at":"2026-07-05T00:00:00Z"},{"id":"redeemed","status":"redeemed","expires_at":"2026-07-05T00:00:00Z"}`,
 		},
 		{
 			name:    "a credit without an id is skipped",
-			credits: `{"status":"available","expires_at":"2026-07-01T00:00:00Z"}`,
+			credits: `{"status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
 		},
 		{
 			name: "an empty listing consumes nothing",
@@ -212,38 +253,30 @@ func TestResetCreditSelection(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			useFakeClock(t, testClock)
 			fake := scriptedResetHost(test.credits, http.StatusOK, consumeCodeReset)
 
-			consumed := runReset(fake, resetConfig("secret-key"), usageRecord(hitBody()))
-			if consumed != (test.wantCredit != "") {
-				t.Fatalf("runReset = %v, want %v", consumed, test.wantCredit != "")
+			lastLog := reasonNoAvailableCredit
+			if test.wantCredit != "" {
+				lastLog = reasonCooldownCleared
 			}
-
-			var consumedCredit string
-			for _, request := range fake.requests() {
-				if request.Method == http.MethodPost && request.URL == consumeURL {
-					var redeem consumeRequest
-					if errUnmarshal := json.Unmarshal(request.Body, &redeem); errUnmarshal != nil {
-						t.Fatalf("decode consume body %s: %v", request.Body, errUnmarshal)
-					}
-					consumedCredit = redeem.CreditID
-				}
-			}
-			if consumedCredit != test.wantCredit {
-				t.Errorf("consumed credit = %q, want %q", consumedCredit, test.wantCredit)
-			}
+			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
 
 			wantCalls := 1 // the listing
 			if test.wantCredit != "" {
-				wantCalls = 3
+				wantCalls = 3 // plus the consume and the cooldown clear
 			}
-			if calls := fake.requests(); len(calls) != wantCalls {
-				t.Errorf("http.do calls = %d, want %d", len(calls), wantCalls)
+			if got := fake.requestCount(); got != wantCalls {
+				t.Fatalf("http.do calls = %d, want %d", got, wantCalls)
 			}
 			if test.wantCredit == "" {
 				if got := logsWithMessage(fake.logged(), reasonNoAvailableCredit); len(got) != 1 {
 					t.Errorf("no-credit logs = %+v, want one", got)
 				}
+				return
+			}
+			if got := consumedCredit(t, fake).CreditID; got != test.wantCredit {
+				t.Errorf("consumed credit = %q, want %q", got, test.wantCredit)
 			}
 		})
 	}
@@ -309,28 +342,31 @@ func TestResetCredentialHeaderFallbacks(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fake := scriptedResetHost(`{"id":"c","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, http.StatusOK, consumeCodeReset)
-			fake.auths["c1f0a9"] = pluginapi.HostAuthGetResponse{JSON: json.RawMessage(test.authJSON)}
+			useFakeClock(t, testClock)
+			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+			fake.withCredential(authIndex, test.authJSON)
 
-			consumed := runReset(fake, resetConfig("secret-key"), usageRecord(hitBody()))
-			if consumed != test.wantAnyRequest {
-				t.Fatalf("runReset = %v, want %v", consumed, test.wantAnyRequest)
+			lastLog := reasonNoAccessToken
+			if test.wantAnyRequest {
+				lastLog = reasonCooldownCleared
 			}
-			requests := fake.requests()
+			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
+
+			listing := fake.requestsFor(http.MethodGet, creditsURL)
 			if !test.wantAnyRequest {
-				if len(requests) != 0 {
-					t.Fatalf("http.do calls = %+v, want none", requests)
+				if got := fake.requestCount(); got != 0 {
+					t.Fatalf("http.do calls = %d, want none", got)
 				}
 				if got := logsWithMessage(fake.logged(), reasonNoAccessToken); len(got) != 1 {
 					t.Errorf("no-access-token logs = %+v, want one", got)
 				}
 				return
 			}
-			if len(requests) == 0 {
-				t.Fatalf("no request was made, want the credit listing")
+			if len(listing) != 1 {
+				t.Fatalf("listing requests = %d, want one", len(listing))
 			}
-			assertHeader(t, requests[0], "Authorization", "Bearer tok-123")
-			if got := requests[0].Headers.Get("ChatGPT-Account-ID"); got != test.wantAccount {
+			assertHeader(t, listing[0], "Authorization", "Bearer "+accessToken)
+			if got := listing[0].Headers.Get("ChatGPT-Account-ID"); got != test.wantAccount {
 				t.Errorf("ChatGPT-Account-ID = %q, want %q", got, test.wantAccount)
 			}
 		})
@@ -358,27 +394,26 @@ func TestResetConsumeOutcomes(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fake := scriptedResetHost(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, test.status, "")
-			fake.routes[1].Body = test.body
+			useFakeClock(t, testClock)
+			fake := scriptedResetHost(aUsableCredit, test.status, "")
+			fake.script(http.MethodPost, consumeURL, test.status, test.body)
 
-			if got := runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())); got != test.wantConsumed {
-				t.Fatalf("runReset = %v, want %v", got, test.wantConsumed)
+			lastLog := reasonConsumeFailed
+			if test.wantCooldown {
+				lastLog = reasonCooldownCleared
 			}
+			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
 
-			requests := fake.requests()
 			wantCalls := 2 // the listing and the consume
 			if test.wantCooldown {
 				wantCalls = 3 // plus the cooldown clear
 			}
-			if len(requests) != wantCalls {
-				t.Fatalf("http.do calls = %d, want %d", len(requests), wantCalls)
+			if got := fake.requestCount(); got != wantCalls {
+				t.Fatalf("http.do calls = %d, want %d", got, wantCalls)
 			}
-			var redeem consumeRequest
-			if errUnmarshal := json.Unmarshal(requests[1].Body, &redeem); errUnmarshal != nil {
-				t.Fatalf("decode consume body %s: %v", requests[1].Body, errUnmarshal)
-			}
-			if redeem.CreditID != "credit-1" || !uuidV4Pattern.MatchString(redeem.RedeemRequestID) {
-				t.Errorf("consume body = %+v, want credit-1 and a UUID v4", redeem)
+			redeem := consumedCredit(t, fake)
+			if redeem.CreditID != "credit-1" {
+				t.Errorf("consume credit_id = %q, want credit-1", redeem.CreditID)
 			}
 
 			logs := fake.logged()
@@ -414,20 +449,18 @@ func TestResetListingFailuresAbortTheFlow(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fake := scriptedResetHost(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, http.StatusOK, consumeCodeReset)
+			useFakeClock(t, testClock)
+			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 			if test.transport {
-				fake.httpHandler = func(httpRequest) (pluginapi.HTTPResponse, error) {
-					return pluginapi.HTTPResponse{}, errFakeTransport
-				}
+				fake.scriptFailure(http.MethodGet, creditsURL, errFakeTransport)
 			} else {
-				fake.routes[0].Status, fake.routes[0].Body = test.status, test.body
+				fake.script(http.MethodGet, creditsURL, test.status, test.body)
 			}
 
-			if runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())) {
-				t.Fatalf("runReset = true, want the flow aborted")
-			}
-			if calls := fake.requests(); len(calls) != 1 {
-				t.Fatalf("http.do calls = %d, want only the listing", len(calls))
+			driveHit(t, fake, managementConfigYAML, reasonCreditsListFailed, hitRecord())
+
+			if got := fake.requestCount(); got != 1 {
+				t.Fatalf("http.do calls = %d, want only the listing", got)
 			}
 			if got := logsWithMessage(fake.logged(), reasonCreditsListFailed); len(got) != 1 {
 				t.Errorf("listing-failure logs = %+v, want one", got)
@@ -437,13 +470,13 @@ func TestResetListingFailuresAbortTheFlow(t *testing.T) {
 }
 
 func TestResetWithoutACredentialAborts(t *testing.T) {
-	fake := newFakeHost()
+	useFakeClock(t, testClock)
+	fake := newFakeHost().script(http.MethodGet, creditsURL, http.StatusOK, creditsBody(aUsableCredit))
 
-	if runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())) {
-		t.Fatalf("runReset = true, want the flow aborted")
-	}
-	if calls := fake.requests(); len(calls) != 0 {
-		t.Errorf("http.do calls = %+v, want none", calls)
+	driveHit(t, fake, managementConfigYAML, reasonAuthUnreadable, hitRecord())
+
+	if got := fake.requestCount(); got != 0 {
+		t.Errorf("http.do calls = %d, want none", got)
 	}
 	if got := logsWithMessage(fake.logged(), reasonAuthUnreadable); len(got) != 1 {
 		t.Errorf("auth-failure logs = %+v, want one", got)
@@ -461,27 +494,18 @@ func TestCooldownClearFailureIsLoggedAndNeverRetried(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fake := scriptedResetHost(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, http.StatusOK, consumeCodeReset)
+			useFakeClock(t, testClock)
+			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 			if test.transport {
-				// The listing and the consume succeed; only the cooldown call fails.
-				fake.httpHandler = func(request httpRequest) (pluginapi.HTTPResponse, error) {
-					switch {
-					case request.Method == http.MethodGet:
-						return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(creditsBody(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`))}, nil
-					case request.URL == consumeURL:
-						return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"code":"reset"}`)}, nil
-					}
-					return pluginapi.HTTPResponse{}, errFakeTransport
-				}
+				fake.scriptFailure(http.MethodPost, quotaURL, errFakeTransport)
 			} else {
-				fake.routes[2].Status = http.StatusInternalServerError
+				fake.script(http.MethodPost, quotaURL, http.StatusInternalServerError, `{"error":"boom"}`)
 			}
 
-			if !runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())) {
-				t.Fatalf("runReset = false, want the consumed credit reported")
-			}
-			if calls := fake.requests(); len(calls) != 3 {
-				t.Fatalf("http.do calls = %d, want exactly one cooldown attempt", len(calls))
+			driveHit(t, fake, managementConfigYAML, reasonCooldownFailed, hitRecord())
+
+			if got := fake.requestCount(); got != 3 {
+				t.Fatalf("http.do calls = %d, want exactly one cooldown attempt", got)
 			}
 			logs := fake.logged()
 			if got := logsWithMessage(logs, reasonResetSucceeded); len(got) != 1 {
@@ -495,34 +519,35 @@ func TestCooldownClearFailureIsLoggedAndNeverRetried(t *testing.T) {
 }
 
 func TestCooldownClearIsSkippedWithoutAManagementKey(t *testing.T) {
-	fake := scriptedResetHost(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, http.StatusOK, consumeCodeReset)
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 
-	if !runReset(fake, resetConfig(""), usageRecord(hitBody())) {
-		t.Fatalf("runReset = false, want the consumed credit reported")
-	}
-	if calls := fake.requests(); len(calls) != 2 {
-		t.Fatalf("http.do calls = %d, want the listing and the consume only", len(calls))
+	driveHit(t, fake, "enabled: true\n", reasonManagementKeyEmpty, hitRecord())
+
+	if got := fake.requestCount(); got != 2 {
+		t.Fatalf("http.do calls = %d, want the listing and the consume only", got)
 	}
 	if got := logsWithMessage(fake.logged(), reasonManagementKeyEmpty); len(got) != 1 {
 		t.Errorf("management-key logs = %+v, want one", got)
 	}
 }
 
+// TestIdempotencyKeyIsGeneratedPerFlow pins D18: the key is generated once per flow,
+// not once per process and not inside a retry loop, so a replayed consume can never
+// burn a second credit.
 func TestIdempotencyKeyIsGeneratedPerFlow(t *testing.T) {
+	useFakeClock(t, testClock)
+	registerConfig(t, scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset), managementConfigYAML)
+
 	keys := make([]string, 0, 2)
-	for range 2 {
-		fake := scriptedResetHost(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`, http.StatusOK, consumeCodeReset)
-		if !runReset(fake, resetConfig("secret-key"), usageRecord(hitBody())) {
-			t.Fatalf("runReset = false, want a consumed credit")
-		}
-		var redeem consumeRequest
-		if errUnmarshal := json.Unmarshal(fake.requests()[1].Body, &redeem); errUnmarshal != nil {
-			t.Fatalf("decode consume body: %v", errUnmarshal)
-		}
-		if !uuidV4Pattern.MatchString(redeem.RedeemRequestID) {
-			t.Fatalf("redeem_request_id = %q, want a UUID v4", redeem.RedeemRequestID)
-		}
-		keys = append(keys, redeem.RedeemRequestID)
+	for _, index := range []string{authIndex, "b2e1c8"} {
+		fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+		fake.withCredential(index, `{"access_token":"`+accessToken+`","account_id":"`+accountID+`"}`)
+		record := hitRecord()
+		record.AuthIndex = index
+		sendUsage(t, fake, record)
+		waitForLog(t, fake, reasonCooldownCleared)
+		keys = append(keys, consumedCredit(t, fake).RedeemRequestID)
 	}
 	if keys[0] == keys[1] {
 		t.Errorf("both flows used the idempotency key %q, want a fresh key per flow", keys[0])
@@ -533,32 +558,24 @@ func TestIdempotencyKeyIsGeneratedPerFlow(t *testing.T) {
 // usage.handle: the reset flow must run off the usage goroutine (D11), and a second
 // signal for the same credential while it is in flight must be dropped (D12).
 func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
-	fake := newFakeHost()
-	fake.auths["c1f0a9"] = pluginapi.HostAuthGetResponse{JSON: json.RawMessage(`{"access_token":"tok-123","account_id":"acct-123"}`)}
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 	released := make(chan struct{})
+	// Park the flow inside the credit listing so every later signal arrives while the
+	// first one is still running.
 	fake.httpHandler = func(request httpRequest) (pluginapi.HTTPResponse, error) {
-		switch {
-		case request.Method == http.MethodGet:
+		if request.URL == creditsURL {
 			<-released
-			return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(creditsBody(`{"id":"credit-1","status":"available","expires_at":"2026-07-01T00:00:00Z"}`))}, nil
-		case request.URL == consumeURL:
-			return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"code":"reset"}`)}, nil
-		default:
-			return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"status":"ok"}`)}, nil
 		}
+		return fake.answer(request)
 	}
+	registerConfig(t, fake, managementConfigYAML)
 
-	activeReset = newResetState()
-	t.Cleanup(func() { activeReset = newResetState() })
-	if _, errRegister := handleMethod(fake, pluginabi.MethodPluginRegister, lifecyclePayload(t, "enabled: true\nmanagement_key: secret-key\n")); errRegister != nil {
-		t.Fatalf("register: %v", errRegister)
-	}
-	fake.logs = nil
-	record := marshalRecord(t, usageRecord(hitBody()))
-
+	record := hitRecord()
+	payload := marshalRecord(t, record)
 	returned := make(chan []byte, 1)
 	go func() {
-		raw, _ := handleMethod(fake, pluginabi.MethodUsageHandle, record)
+		raw, _ := handleMethod(fake, pluginabi.MethodUsageHandle, payload)
 		returned <- raw
 	}()
 	select {
@@ -572,18 +589,20 @@ func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
 
 	// The flow is parked in the credit listing; the second signal must be dropped.
 	waitFor(t, func() bool { return len(fake.authGetCalls()) == 1 })
-	if _, errHandle := handleMethod(fake, pluginabi.MethodUsageHandle, record); errHandle != nil {
-		t.Fatalf("second usage.handle: %v", errHandle)
-	}
+	sendUsage(t, fake, record)
 	if got := len(fake.authGetCalls()); got != 1 {
 		t.Fatalf("auth.get calls = %d, want 1: a concurrent signal must not start a second flow", got)
 	}
-	if got := logsWithMessage(fake.logged(), reasonResetDropped); len(got) != 1 {
-		t.Errorf("dropped-signal logs = %+v, want one", got)
+	dropped := logsWithMessage(fake.logged(), reasonResetInFlight)
+	if len(dropped) != 1 {
+		t.Fatalf("in-flight drops = %+v, want one", dropped)
+	}
+	if dropped[0].Level != "debug" {
+		t.Errorf("drop log level = %q, want debug", dropped[0].Level)
 	}
 
 	close(released)
-	waitFor(t, func() bool { return len(fake.requests()) == 3 })
+	waitFor(t, func() bool { return fake.requestCount() == 3 })
 	if got := len(fake.authGetCalls()); got != 1 {
 		t.Errorf("auth.get calls = %d, want 1", got)
 	}
@@ -600,5 +619,82 @@ func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
 	}
 	if !reflect.DeepEqual(trace, want) {
 		t.Errorf("http call trace = %v, want %v", trace, want)
+	}
+}
+
+// TestResetSuppressionBlocksRetriggerWithinFiveMinutes is the acceptance test for spec
+// story 14: five minutes of silence after a credited reset, and eligibility again once
+// the window has passed.
+func TestResetSuppressionBlocksRetriggerWithinFiveMinutes(t *testing.T) {
+	clock := useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+	registerConfig(t, fake, managementConfigYAML)
+
+	sendUsage(t, fake, hitRecord())
+	waitForLog(t, fake, reasonCooldownCleared)
+	// Probe until the flow has released its slot and the suppression window applies.
+	waitForSuppressed(t, fake, hitRecord())
+	afterFirstFlow := fake.requestCount()
+	if afterFirstFlow != 3 {
+		t.Fatalf("http.do calls after the first flow = %d, want 3", afterFirstFlow)
+	}
+
+	clock.advance(time.Minute)
+	sendUsage(t, fake, hitRecord())
+	sendUsage(t, fake, hitRecord())
+	if got := fake.requestCount(); got != afterFirstFlow {
+		t.Errorf("http.do calls inside the window = %d, want %d", got, afterFirstFlow)
+	}
+	if got := len(fake.authGetCalls()); got != 1 {
+		t.Errorf("auth.get calls inside the window = %d, want 1", got)
+	}
+	if got := logsWithMessage(fake.logged(), reasonResetSuppressed); len(got) < 2 {
+		t.Errorf("suppression drops = %d, want the signals inside the window dropped", len(got))
+	}
+
+	// Past the window the credential is eligible again and spends a second credit.
+	clock.advance(resetSuppressWindow)
+	sendUsage(t, fake, hitRecord())
+	waitFor(t, func() bool { return fake.requestCount() == 6 })
+	if got := logsWithMessage(fake.logged(), reasonCooldownCleared); len(got) != 2 {
+		t.Errorf("cooldown-clear logs = %d, want a second flow after the window", len(got))
+	}
+}
+
+// TestConcurrentSignalsStartOneFlow pins spec story 13: many simultaneous signals for
+// one credential produce exactly one flow.
+func TestConcurrentSignalsStartOneFlow(t *testing.T) {
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+	released := make(chan struct{})
+	fake.httpHandler = func(request httpRequest) (pluginapi.HTTPResponse, error) {
+		if request.URL == creditsURL {
+			<-released
+		}
+		return fake.answer(request)
+	}
+	registerConfig(t, fake, managementConfigYAML)
+
+	const signals = 64
+	payload := marshalRecord(t, hitRecord())
+	var wait sync.WaitGroup
+	for range signals {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			// Assertions stay on the test goroutine; this only drives the RPC.
+			_, _ = handleMethod(fake, pluginabi.MethodUsageHandle, payload)
+		}()
+	}
+	wait.Wait()
+
+	// Every caller but the winner is dropped synchronously, so this count is exact.
+	if got := len(logsWithMessage(fake.logged(), reasonResetInFlight)); got != signals-1 {
+		t.Errorf("in-flight drops = %d, want %d", got, signals-1)
+	}
+	close(released)
+	waitFor(t, func() bool { return fake.requestCount() == 3 })
+	if got := len(fake.authGetCalls()); got != 1 {
+		t.Errorf("auth.get calls = %d, want exactly one flow", got)
 	}
 }

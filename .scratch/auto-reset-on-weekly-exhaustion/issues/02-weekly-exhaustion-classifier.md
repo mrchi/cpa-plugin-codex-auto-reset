@@ -6,7 +6,7 @@
 
 **Status:** ready-for-review
 
-- [x] 429 + type=usage_limit_reached + 周窗 + resets_in_seconds>86400 的未排除凭证判定为命中并写日志
+- [x] 429 + type=usage_limit_reached + 周窗 + 距重置超过一天（`resets_in_seconds>86400`，缺失时用 `resets_at` 推算）的未排除凭证判定为命中并写日志（`TestUsageHandleClassifiesExhaustion`，含 `resets_at` 单字段的用例）
 - [x] limit_window_minutes 缺失时 resets_in_seconds>18000 兜底判为周窗
 - [x] 5 小时窗用尽、一天内自然恢复、enabled=false、凭证在排除列表中四种情况均不命中，且各有日志
 - [x] 非 codex 凭证、非 429、非 usage_limit_reached 的记录被静默忽略

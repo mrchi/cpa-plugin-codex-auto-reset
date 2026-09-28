@@ -205,20 +205,13 @@ func classificationFields(record pluginapi.UsageRecord, result classification) m
 		"auth_index":        record.AuthIndex,
 		"model":             record.Model,
 		"resets_in_seconds": result.ResetsInSeconds,
+		"window":            result.Window,
 	}
 	if result.HasWindowMinutes {
 		fields["limit_window_minutes"] = result.WindowMinutes
 		fields["window_source"] = "limit_window_minutes"
 	} else {
 		fields["window_source"] = "resets_in_seconds"
-	}
-	switch {
-	case result.Weekly:
-		fields["window"] = "weekly"
-	case result.HasWindowMinutes || result.ResetsInSeconds > 0:
-		fields["window"] = "5h"
-	default:
-		fields["window"] = "unknown"
 	}
 	return fields
 }
