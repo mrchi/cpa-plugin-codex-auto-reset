@@ -173,11 +173,11 @@ func TestInvalidConfigWarnsAndKeepsTheDefaults(t *testing.T) {
 		payload func(t *testing.T) []byte
 	}{
 		{
-			name:    "an unparseable lifecycle request",
+			name:    "an unparsable lifecycle request",
 			payload: func(*testing.T) []byte { return []byte("not a lifecycle request") },
 		},
 		{
-			name: "an unparseable config document",
+			name: "an unparsable config document",
 			payload: func(t *testing.T) []byte {
 				return lifecyclePayload(t, "enabled: false\nmanagement_key: [unterminated\n")
 			},

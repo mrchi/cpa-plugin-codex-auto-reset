@@ -247,7 +247,7 @@ func clearCooldown(h host, cfg pluginConfig, record pluginapi.UsageRecord) {
 
 // pickCredit returns the available credit closest to expiry. A credit that has already
 // expired is skipped: consuming it would only earn a no_credit, which would abandon
-// the flow while a usable credit sits next to it. A null (or unparseable) expires_at
+// the flow while a usable credit sits next to it. A null (or unparsable) expires_at
 // means "never expires" and always ranks last (D16). Credits are spent before their
 // 30-day expiry rather than hoarded (spec story 7).
 func pickCredit(credits []resetCredit) (resetCredit, bool) {

@@ -228,7 +228,7 @@ func TestResetCreditSelection(t *testing.T) {
 			wantCredit: "forever",
 		},
 		{
-			name:       "unparseable expiry ranks last",
+			name:       "unparsable expiry ranks last",
 			credits:    `{"id":"broken","status":"available","expires_at":"tomorrow"},{"id":"dated","status":"available","expires_at":"2026-07-05T00:00:00Z"}`,
 			wantCredit: "dated",
 		},
@@ -387,7 +387,7 @@ func TestResetConsumeOutcomes(t *testing.T) {
 		{name: "nothing_to_reset consumes nothing", status: http.StatusOK, body: `{"code":"nothing_to_reset"}`, wantReasonCode: "nothing_to_reset"},
 		{name: "no_credit consumes nothing", status: http.StatusOK, body: `{"code":"no_credit"}`, wantReasonCode: "no_credit"},
 		{name: "an unknown code is a failure", status: http.StatusOK, body: `{"code":"slow_down"}`, wantReasonCode: "slow_down"},
-		{name: "an unparseable body is a failure", status: http.StatusOK, body: `not json`},
+		{name: "an unparsable body is a failure", status: http.StatusOK, body: `not json`},
 		{name: "a 500 is a failure", status: http.StatusInternalServerError, body: `{"error":"boom"}`},
 		{name: "a 401 is a failure", status: http.StatusUnauthorized, body: ``},
 	}
@@ -443,7 +443,7 @@ func TestResetListingFailuresAbortTheFlow(t *testing.T) {
 		transport bool
 	}{
 		{name: "a non-2xx listing is a failure", status: http.StatusForbidden, body: `{"error":"forbidden"}`},
-		{name: "an unparseable listing is a failure", status: http.StatusOK, body: `not json`},
+		{name: "an unparsable listing is a failure", status: http.StatusOK, body: `not json`},
 		{name: "a transport error is a failure", transport: true},
 	}
 

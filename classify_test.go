@@ -221,7 +221,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			wantWindow: windowWeekly,
 		},
 		{
-			name:       "an unparseable resets_at is not a hit",
+			name:       "an unparsable resets_at is not a hit",
 			configYAML: "enabled: true\n",
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_at":"soon"`)),
 			wantLevel:  "debug",
@@ -314,7 +314,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			record:     usageRecord(quotaBody(true, `"type":"rate_limit_error","resets_in_seconds":200000`)),
 		},
 		{
-			name:       "unparseable body is ignored",
+			name:       "unparsable body is ignored",
 			configYAML: "enabled: true\n",
 			record:     usageRecord("upstream 429 without a json body"),
 		},
