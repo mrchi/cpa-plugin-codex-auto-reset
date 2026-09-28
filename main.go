@@ -169,23 +169,51 @@ func pluginRegistration() registration {
 	}
 }
 
-// handleUsage is observation only: CPA ignores the response (D22). Exhaustion
-// classification and the reset flow land in later tickets; for now every record is
-// logged through the host seam.
+// handleUsage classifies one usage record and logs the decision; the reset flow
+// lands in a later ticket. CPA ignores the response (D22), so it returns immediately
+// (D11) and never acts on the record here.
 func handleUsage(h host, request []byte) ([]byte, error) {
 	var record pluginapi.UsageRecord
 	if errUnmarshal := json.Unmarshal(request, &record); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	h.log("debug", "usage record observed", logFields(map[string]any{
-		"enabled":     loadedConfig().Enabled,
-		"provider":    record.Provider,
-		"auth_id":     record.AuthID,
-		"auth_index":  record.AuthIndex,
-		"failed":      record.Failed,
-		"status_code": record.Failure.StatusCode,
-	}))
+	result := classify(record, loadedConfig())
+	if result.Reason == "" {
+		return okEnvelope(struct{}{})
+	}
+	level := "debug"
+	if result.Hit {
+		level = "info"
+	}
+	h.log(level, result.Reason, logFields(classificationFields(record, result)))
 	return okEnvelope(struct{}{})
+}
+
+// classificationFields carries everything needed to audit the decision after the
+// fact: which credential and model, the upstream reset timing, and how the window was
+// classified (spec story 17).
+func classificationFields(record pluginapi.UsageRecord, result classification) map[string]any {
+	fields := map[string]any{
+		"auth_id":           record.AuthID,
+		"auth_index":        record.AuthIndex,
+		"model":             record.Model,
+		"resets_in_seconds": result.ResetsInSeconds,
+	}
+	if result.HasWindowMinutes {
+		fields["limit_window_minutes"] = result.WindowMinutes
+		fields["window_source"] = "limit_window_minutes"
+	} else {
+		fields["window_source"] = "resets_in_seconds"
+	}
+	switch {
+	case result.Weekly:
+		fields["window"] = "weekly"
+	case result.HasWindowMinutes || result.ResetsInSeconds > 0:
+		fields["window"] = "5h"
+	default:
+		fields["window"] = "unknown"
+	}
+	return fields
 }
 
 // hostAPI is written once by cliproxy_plugin_init, before any RPC call arrives.

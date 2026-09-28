@@ -19,6 +19,7 @@ type fakeHost struct {
 	httpHandler func(httpRequest) (pluginapi.HTTPResponse, error)
 
 	httpCalls []httpRequest
+	authGets  []string
 }
 
 type fakeLog struct {
@@ -52,6 +53,7 @@ func (f *fakeHost) log(level, message string, fields map[string]any) {
 func (f *fakeHost) authGet(authIndex string) (pluginapi.HostAuthGetResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.authGets = append(f.authGets, authIndex)
 	entry, okAuth := f.auths[authIndex]
 	if !okAuth {
 		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("auth %q not found", authIndex)
@@ -90,4 +92,10 @@ func (f *fakeHost) requests() []httpRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]httpRequest(nil), f.httpCalls...)
+}
+
+func (f *fakeHost) authGetCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.authGets...)
 }
