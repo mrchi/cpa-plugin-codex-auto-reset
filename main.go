@@ -80,6 +80,9 @@ var activeHost host = cgoHost{}
 // currentConfig holds the latest register/reconfigure configuration.
 var currentConfig atomic.Value
 
+// activeReset is the process-wide debounce for the reset flow (D12).
+var activeReset = newResetState()
+
 func main() {}
 
 //export cliproxy_plugin_init
@@ -169,15 +172,16 @@ func pluginRegistration() registration {
 	}
 }
 
-// handleUsage classifies one usage record and logs the decision; the reset flow
-// lands in a later ticket. CPA ignores the response (D22), so it returns immediately
-// (D11) and never acts on the record here.
+// handleUsage classifies one usage record, logs the decision, and hands a hit to the
+// reset flow. CPA ignores the response (D22), so it returns immediately (D11): the
+// reset flow runs on its own goroutine and never affects this request's outcome.
 func handleUsage(h host, request []byte) ([]byte, error) {
 	var record pluginapi.UsageRecord
 	if errUnmarshal := json.Unmarshal(request, &record); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	result := classify(record, loadedConfig())
+	cfg := loadedConfig()
+	result := classify(record, cfg)
 	if result.Reason == "" {
 		return okEnvelope(struct{}{})
 	}
@@ -186,6 +190,9 @@ func handleUsage(h host, request []byte) ([]byte, error) {
 		level = "info"
 	}
 	h.log(level, result.Reason, logFields(classificationFields(record, result)))
+	if result.Hit {
+		startReset(activeReset, h, cfg, record)
+	}
 	return okEnvelope(struct{}{})
 }
 

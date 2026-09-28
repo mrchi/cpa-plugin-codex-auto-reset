@@ -218,6 +218,10 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 				t.Fatalf("register: %v", errRegister)
 			}
 			fake.logs = nil
+			// A fresh debounce state per case: a hit dispatches the reset flow (ticket
+			// 03), and a flow still running from a previous case must not suppress this
+			// case's signal.
+			activeReset = newResetState()
 
 			raw, errHandle := handleMethod(fake, pluginabi.MethodUsageHandle, marshalRecord(t, test.record))
 			if errHandle != nil {
@@ -233,26 +237,35 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 					t.Fatalf("logs = %+v, want the record ignored without logging", logs)
 				}
 			} else {
-				if len(logs) != 1 {
-					t.Fatalf("logs = %+v, want exactly one", logs)
+				// A hit also produces reset-flow logs on the dispatched goroutine, so
+				// the verdict is the record carrying the expected reason.
+				matched := logsWithMessage(logs, test.wantReason)
+				if len(matched) != 1 {
+					t.Fatalf("logs with reason %q = %+v, want exactly one (all logs: %+v)", test.wantReason, matched, logs)
 				}
-				if logs[0].Level != test.wantLevel {
-					t.Errorf("level = %q, want %q", logs[0].Level, test.wantLevel)
-				}
-				if logs[0].Message != test.wantReason {
-					t.Errorf("message = %q, want %q", logs[0].Message, test.wantReason)
+				if matched[0].Level != test.wantLevel {
+					t.Errorf("level = %q, want %q", matched[0].Level, test.wantLevel)
 				}
 				for _, field := range []string{"plugin", "auth_id", "auth_index", "model", "resets_in_seconds", "window"} {
-					if _, okField := logs[0].Fields[field]; !okField {
-						t.Errorf("field %q missing from %v", field, logs[0].Fields)
+					if _, okField := matched[0].Fields[field]; !okField {
+						t.Errorf("field %q missing from %v", field, matched[0].Fields)
 					}
 				}
-				if logs[0].Fields["plugin"] != pluginID {
-					t.Errorf("field plugin = %v, want %q", logs[0].Fields["plugin"], pluginID)
+				if matched[0].Fields["plugin"] != pluginID {
+					t.Errorf("field plugin = %v, want %q", matched[0].Fields["plugin"], pluginID)
 				}
 			}
 
-			// Classification is observation only: no reset work happens here (ticket 03).
+			if test.wantReason == reasonHit {
+				// A hit hands the record to the reset flow on its own goroutine; what
+				// that flow does is ticket 03's subject.
+				waitFor(t, func() bool { return len(fake.authGetCalls()) == 1 })
+				if calls := fake.requests(); len(calls) != 0 {
+					t.Errorf("http.do calls = %+v, want none", calls)
+				}
+				return
+			}
+			// Records that do not hit are observation only: no reset work happens.
 			if calls := fake.authGetCalls(); len(calls) != 0 {
 				t.Errorf("auth.get calls = %v, want none", calls)
 			}

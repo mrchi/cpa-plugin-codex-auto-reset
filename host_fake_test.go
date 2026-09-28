@@ -20,6 +20,9 @@ type fakeHost struct {
 
 	httpCalls []httpRequest
 	authGets  []string
+	// trace records every callback in order, so a test can assert a sequence that
+	// spans callback kinds (auth.get → http.do …).
+	trace []string
 }
 
 type fakeLog struct {
@@ -54,6 +57,7 @@ func (f *fakeHost) authGet(authIndex string) (pluginapi.HostAuthGetResponse, err
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.authGets = append(f.authGets, authIndex)
+	f.trace = append(f.trace, "auth.get "+authIndex)
 	entry, okAuth := f.auths[authIndex]
 	if !okAuth {
 		return pluginapi.HostAuthGetResponse{}, fmt.Errorf("auth %q not found", authIndex)
@@ -69,12 +73,16 @@ func (f *fakeHost) authList() ([]pluginapi.HostAuthFileEntry, error) {
 
 func (f *fakeHost) httpDo(request httpRequest) (pluginapi.HTTPResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.httpCalls = append(f.httpCalls, request)
-	if f.httpHandler != nil {
-		return f.httpHandler(request)
+	f.trace = append(f.trace, "http.do "+request.Method+" "+request.URL)
+	handler, routes := f.httpHandler, f.routes
+	f.mu.Unlock()
+	// The lock is released before answering: a scripted handler may block to hold the
+	// flow in place, and other callbacks must not queue behind it.
+	if handler != nil {
+		return handler(request)
 	}
-	for _, route := range f.routes {
+	for _, route := range routes {
 		if route.Method == request.Method && strings.HasPrefix(request.URL, route.URL) {
 			return pluginapi.HTTPResponse{StatusCode: route.Status, Body: []byte(route.Body)}, nil
 		}
@@ -98,4 +106,10 @@ func (f *fakeHost) authGetCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.authGets...)
+}
+
+func (f *fakeHost) callTrace() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.trace...)
 }
