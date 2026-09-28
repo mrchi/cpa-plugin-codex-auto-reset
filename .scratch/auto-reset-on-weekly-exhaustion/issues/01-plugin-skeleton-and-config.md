@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** ready-for-review
 
-- [ ] 编译产物为 c-shared 动态库，能被 CPA 从 plugins 目录加载并完成 register/shutdown
-- [ ] 配置项 enabled / exclude_credentials / management_key / management_base_url 全部可解析，缺失时有文档化的默认值或明确报错
-- [ ] 插件日志经 host.log 输出，带插件标识
-- [ ] fake host 回调接缝就位，后续 ticket 的测试无需真 CPA 进程
+- [x] 编译产物为 c-shared 动态库，能被 CPA 从 plugins 目录加载并完成 register/shutdown
+- [x] 配置项 enabled / exclude_credentials / management_key / management_base_url 全部可解析，缺失时有文档化的默认值或明确报错
+- [x] 插件日志经 host.log 输出，带插件标识
+- [x] fake host 回调接缝就位，后续 ticket 的测试无需真 CPA 进程
