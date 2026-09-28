@@ -48,3 +48,4 @@
 - D20 `host.http.do` 无超时，本实现不引入 `host.http.operation_open`/`cancel`。上限：上游挂死会占住该凭证的 `inFlight`（单凭证，不阻塞 CPA 队列），升级路径是改用 operation/cancel 加 deadline。代码里以 `ponytail:` 注释标注。
 - D21 不做 token 刷新（spec Out of Scope）：access token 过期就是一次失败，回落默认行为。
 - D22 当前客户端请求不重试、不重放（spec 决策）：插件对 `usage.handle` 只回 `{}`。
+- D23 `pluginapi.HTTPRequest` / `HTTPResponse` 无 JSON tag，直接 marshal 会得到 host 读不到的 PascalCase key。`host.http.do` 的请求必须用 `host.go` 里已有的手写 wire struct（`httpRequest`，snake_case）；响应方向 `HTTPResponse` 的 `StatusCode`/`Headers`/`Body` 恰好就是 PascalCase，可直接反序列化。不要"顺手统一"成 SDK struct。
