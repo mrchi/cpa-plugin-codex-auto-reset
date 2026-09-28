@@ -49,3 +49,4 @@
 - D21 不做 token 刷新（spec Out of Scope）：access token 过期就是一次失败，回落默认行为。
 - D22 当前客户端请求不重试、不重放（spec 决策）：插件对 `usage.handle` 只回 `{}`。
 - D23 `pluginapi.HTTPRequest` / `HTTPResponse` 无 JSON tag，直接 marshal 会得到 host 读不到的 PascalCase key。`host.http.do` 的请求必须用 `host.go` 里已有的手写 wire struct（`httpRequest`，snake_case）；响应方向 `HTTPResponse` 的 `StatusCode`/`Headers`/`Body` 恰好就是 PascalCase，可直接反序列化。不要"顺手统一"成 SDK struct。
+- D24 **待办（评审阶段处理）**：ticket 02 的触发条件完全依赖错误体的 `resets_in_seconds`，缺失即整条记录不命中——失败模式是"功能静默不生效"而非"降级"，代价最高。spec 的错误体同时带 `resets_at`，应补一条以 `resets_at`（RFC3339）推算秒数的兜底。评审后的修复轮里合入。
