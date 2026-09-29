@@ -19,7 +19,9 @@ func lifecyclePayload(t *testing.T, configYAML string) []byte {
 
 // TestRegisterWithoutConfigKeepsTheDefaults registers with every shape of "no plugin
 // configuration" and shows the defaults are in effect: the plugin stays enabled, and a
-// weekly exhaustion is still classified as a hit.
+// weekly exhaustion is still classified as a hit. The default configuration carries no
+// management key, so the flow stops at the pre-flight and spends nothing — the
+// operator has to configure the key before auto-reset can do anything.
 func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 	cases := map[string][]byte{
 		"no payload":   nil,
@@ -42,9 +44,13 @@ func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 			if len(matched) != 1 || matched[0].Level != "info" {
 				t.Fatalf("hit logs = %+v, want one info line: the default is enabled", matched)
 			}
-			// The hit dispatches the reset flow, which stops at the missing credential:
-			// waiting for its line keeps this case deterministic.
-			waitForLog(t, fake, reasonAuthUnreadable)
+			// The hit dispatches the reset flow, which stops at the pre-flight because
+			// the default configuration carries no management key: waiting for its line
+			// keeps this case deterministic and pins that no credit can be spent.
+			waitForLog(t, fake, reasonManagementKeyEmpty)
+			if got := fake.requestCount(); got != 0 {
+				t.Errorf("http.do calls = %v, want none without a management key", fake.callTrace())
+			}
 		})
 	}
 }
@@ -95,13 +101,13 @@ func TestExcludeCredentialsSkipsMatchingCredential(t *testing.T) {
 		},
 		{
 			name:       "a blank entry never excludes",
-			configYAML: "enabled: true\nexclude_credentials:\n  - \"  \"\n",
+			configYAML: "enabled: true\nmanagement_key: secret-key\nexclude_credentials:\n  - \"  \"\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
 		{
 			name:       "an absent list never excludes",
-			configYAML: "enabled: true\n",
+			configYAML: "enabled: true\nmanagement_key: secret-key\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
@@ -199,13 +205,17 @@ func TestInvalidConfigWarnsAndKeepsTheDefaults(t *testing.T) {
 			}
 
 			// The defaults are in effect: the plugin is enabled, so the record is a hit
-			// and the reset flow starts.
+			// and the reset flow starts — then stops at the missing management key
+			// without touching upstream.
 			fake.clearLogs()
 			sendUsage(t, fake, hitRecord())
 			if got := logsWithMessage(fake.logged(), reasonHit); len(got) != 1 {
 				t.Fatalf("hit logs = %+v, want the default enabled plugin to hit", got)
 			}
-			waitForLog(t, fake, reasonAuthUnreadable)
+			waitForLog(t, fake, reasonManagementKeyEmpty)
+			if got := fake.requestCount(); got != 0 {
+				t.Errorf("http.do calls = %v, want none without a management key", fake.callTrace())
+			}
 		})
 	}
 }

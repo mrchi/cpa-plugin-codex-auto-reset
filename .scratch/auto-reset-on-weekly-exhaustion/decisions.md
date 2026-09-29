@@ -21,7 +21,7 @@
 - D8 配置来源只有 register/reconfigure 请求的 `config_yaml`（base64 → `[]byte` → `yaml.Unmarshal`）。键：
   - `enabled` bool，host 会强制补齐该键（值取自 `plugins.configs.<id>.enabled`）；插件侧缺省视为 `true`
   - `exclude_credentials` []string（auth id / auth 文件名 / auth_index，任一匹配即排除）。匹配只用 `usage.handle` 记录自带的 `AuthID`、`path.Base(AuthID)` 与 `AuthIndex`，**不调 `host.auth.list`**：记录里的字段足够，多一次 host 往返只增加失败面。
-  - `management_key` string（清冷却必需；为空则跳过清冷却并记 warn）
+  - `management_key` string（**硬前提**：为空则命中后立即中止、不消耗任何 credit，只记 warn。清不掉冷却就消费 credit 等于白烧一张卡——凭证仍被锁到旧的 reset 时间，比不装插件更糟，违反 story 16）
   - `management_base_url` string，默认 `http://127.0.0.1:8317`
 - D9 配置解析失败不 panic（panic 会让插件被 host fuse），退回默认值并记日志。
 

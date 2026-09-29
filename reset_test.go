@@ -518,14 +518,21 @@ func TestCooldownClearFailureIsLoggedAndNeverRetried(t *testing.T) {
 	}
 }
 
-func TestCooldownClearIsSkippedWithoutAManagementKey(t *testing.T) {
+// TestMissingManagementKeyConsumesNothing pins the fail-safe: without a management key
+// the cooldown can never be cleared, so spending a credit would leave the credential
+// locked until the old reset time and burn the credit for nothing — worse than the
+// plugin being absent (spec story 16). The flow must stop before touching upstream.
+func TestMissingManagementKeyConsumesNothing(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 
 	driveHit(t, fake, "enabled: true\n", reasonManagementKeyEmpty, hitRecord())
 
-	if got := fake.requestCount(); got != 2 {
-		t.Fatalf("http.do calls = %d, want the listing and the consume only", got)
+	if got := fake.requestCount(); got != 0 {
+		t.Fatalf("http.do calls = %v, want none: the credit must not be spent", fake.callTrace())
+	}
+	if got := len(fake.authGetCalls()); got != 0 {
+		t.Errorf("auth.get calls = %d, want none", got)
 	}
 	if got := logsWithMessage(fake.logged(), reasonManagementKeyEmpty); len(got) != 1 {
 		t.Errorf("management-key logs = %+v, want one", got)

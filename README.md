@@ -38,7 +38,7 @@ plugins:
   configs:
     cpa-plugin-codex-auto-reset:
       enabled: true                          # 总开关；缺失视为 true
-      management_key: "<CPA management key>"  # 清冷却必需，缺失则跳过清冷却并记 warn
+      management_key: "<CPA management key>"  # 必需：缺失时插件不消耗任何 credit（见下）
       management_base_url: "http://127.0.0.1:8317"  # 默认值
       exclude_credentials:                    # 手工管理的账号，插件不碰
         - "codex-user@example.com.json"       # auth 文件名
@@ -46,6 +46,8 @@ plugins:
 ```
 
 `management_key` 取自 CPA 的 `management.secret-key`；插件经本机 management API `POST /v0/management/reset-quota` 清冷却（本机访问不受 `management.allow-remote` 限制，但该 API 仍需 key 非空）。
+
+**`management_key` 缺失时插件不做任何事**：清不掉冷却就消费 credit，等于白烧一张卡还让凭证被锁到旧的 reset 时间——比不装插件更糟。所以命中后若 key 为空，插件立即中止并在日志里记 warn，不发任何上游请求。
 
 ## 已知上限
 

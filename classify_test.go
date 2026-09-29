@@ -374,18 +374,16 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			}
 
 			if test.wantReason == reasonHit {
-				// A hit hands the record to the reset flow on its own goroutine; with no
-				// credential stored the flow stops right there. Waiting for its line is
-				// what keeps the case deterministic.
-				waitForLog(t, fake, reasonAuthUnreadable)
+				// A hit hands the record to the reset flow, which stops at the pre-flight
+				// because these cases configure no management key: waiting for its line
+				// keeps the case deterministic and pins that nothing is spent.
+				waitForLog(t, fake, reasonManagementKeyEmpty)
 			}
 			if got := fake.requestCount(); got != 0 {
 				t.Errorf("http.do calls = %d, want none", got)
 			}
-			if test.wantReason != reasonHit {
-				if got := fake.authGetCalls(); len(got) != 0 {
-					t.Errorf("auth.get calls = %v, want none", got)
-				}
+			if got := fake.authGetCalls(); len(got) != 0 {
+				t.Errorf("auth.get calls = %v, want none", got)
 			}
 		})
 	}

@@ -50,7 +50,7 @@ const (
 	reasonResetSucceeded     = "auto-reset: reset credit consumed"
 	reasonCooldownCleared    = "auto-reset: credential cooldown cleared"
 	reasonCooldownFailed     = "auto-reset: credential cooldown clear failed"
-	reasonManagementKeyEmpty = "auto-reset: management_key is not configured: cooldown not cleared"
+	reasonManagementKeyEmpty = "auto-reset: management_key is not configured: no reset"
 )
 
 // resetCreditsResponse is the GET payload. Unknown fields (the real response carries
@@ -83,6 +83,13 @@ type managementResetQuotaRequest struct {
 // (D11); a signal arriving while a flow is running or inside the suppression window
 // is dropped with a debug log rather than queued (D12).
 func startReset(state *resetState, h host, cfg pluginConfig, record pluginapi.UsageRecord) {
+	// Pre-flight: without a management key the cooldown can never be cleared, so a
+	// consumed credit would leave the credential locked until the old reset time and
+	// buy nothing. Stop before spending anything (spec story 16).
+	if strings.TrimSpace(cfg.ManagementKey) == "" {
+		h.log("warn", reasonManagementKeyEmpty, logFields(resetFields(record, nil)))
+		return
+	}
 	if claimed, reason := state.begin(record.AuthIndex); !claimed {
 		h.log("debug", reason, logFields(resetFields(record, nil)))
 		return
@@ -214,12 +221,9 @@ func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string
 
 // clearCooldown asks CPA's management API to drop the credential's cooldown, so the
 // restored quota is schedulable again (D19, spec story 11). It runs only after a
-// credited consume and never retries: a failure is logged and the flow ends.
+// credited consume and never retries: a failure is logged and the flow ends. A blank
+// key never reaches here — startReset stops the flow before it spends anything.
 func clearCooldown(h host, cfg pluginConfig, record pluginapi.UsageRecord) {
-	if strings.TrimSpace(cfg.ManagementKey) == "" {
-		h.log("warn", reasonManagementKeyEmpty, logFields(resetFields(record, nil)))
-		return
-	}
 	body, errMarshal := json.Marshal(managementResetQuotaRequest{AuthIndex: record.AuthIndex})
 	if errMarshal != nil {
 		h.log("warn", reasonCooldownFailed, logFields(resetFields(record, map[string]any{"error": errMarshal.Error()})))
