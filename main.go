@@ -80,8 +80,8 @@ var activeHost host = cgoHost{}
 // currentConfig holds the latest register/reconfigure configuration.
 var currentConfig atomic.Value
 
-// activeReset is the process-wide debounce for the reset flow (D12).
-var activeReset = newResetState()
+// activeDebounce is the process-wide debounce for the reset flow (D12).
+var activeDebounce = newDebounce()
 
 func main() {}
 
@@ -185,13 +185,13 @@ func handleUsage(h host, request []byte) ([]byte, error) {
 	if result.Reason == "" {
 		return okEnvelope(struct{}{})
 	}
-	level := "debug"
+	level := levelDebug
 	if result.Hit {
-		level = "info"
+		level = levelInfo
 	}
-	h.log(level, result.Reason, logFields(classificationFields(record, result)))
+	h.log(level, result.Reason, classificationFields(record, result))
 	if result.Hit {
-		startReset(activeReset, h, cfg, record)
+		startAutoReset(activeDebounce, h, cfg, record)
 	}
 	return okEnvelope(struct{}{})
 }
@@ -201,19 +201,18 @@ func handleUsage(h host, request []byte) ([]byte, error) {
 // classified (spec story 17).
 func classificationFields(record pluginapi.UsageRecord, result classification) map[string]any {
 	fields := map[string]any{
-		"auth_id":           record.AuthID,
-		"auth_index":        record.AuthIndex,
 		"model":             record.Model,
 		"resets_in_seconds": result.ResetsInSeconds,
 		"window":            result.Window,
+		"window_source":     result.WindowSource,
 	}
-	if result.HasWindowMinutes {
+	if result.WindowMinutes > 0 {
 		fields["limit_window_minutes"] = result.WindowMinutes
-		fields["window_source"] = "limit_window_minutes"
-	} else {
-		fields["window_source"] = "resets_in_seconds"
 	}
-	return fields
+	if result.ResetsSource != "" {
+		fields["resets_source"] = result.ResetsSource
+	}
+	return recordFields(record, fields)
 }
 
 // hostAPI is written once by cliproxy_plugin_init, before any RPC call arrives.

@@ -192,10 +192,13 @@ func useFakeClock(t *testing.T, at time.Time) *fakeClock {
 	t.Helper()
 	fake := &fakeClock{at: at}
 	restore := setClock(fake.now)
-	activeReset = newResetState()
+	activeDebounce = newDebounce()
+	previousDelay := creditsListRetryDelay
+	creditsListRetryDelay = 0
 	t.Cleanup(func() {
 		restore()
-		activeReset = newResetState()
+		activeDebounce = newDebounce()
+		creditsListRetryDelay = previousDelay
 	})
 	return fake
 }

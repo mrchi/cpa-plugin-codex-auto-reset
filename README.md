@@ -15,9 +15,9 @@
 
 命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `expires_at` 最早且未过期的可用 credit → 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却。
 
-任何一步失败（无可用 credit、`nothing_to_reset`、`no_credit`、网络或 HTTP 错误、清冷却失败）都只记日志，回落 CPA 默认冷却行为，不重试、不补偿。当前客户端请求照常返回错误，插件不做请求重放。
+任何一步失败（无可用 credit、`nothing_to_reset`、`no_credit`、网络或 HTTP 错误、清冷却失败）都只记日志，回落 CPA 默认冷却行为，不补偿。唯一的重试是只读的 credit 列表：401/403 直接结束，其它失败流程内最多共试 3 次；consume 与清冷却从不重试。当前客户端请求照常返回错误，插件不做请求重放。
 
-同凭证并发命中只跑一次流程；成功后 5 分钟内不再触发（内存态，随 CPA 重启清空）。
+同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、consume 已发出）5 分钟内不再触发，临时故障不抑制（内存态，随 CPA 重启清空）。
 
 ## 构建
 
@@ -59,4 +59,4 @@ plugins:
 
 ## 日志
 
-全部经 `host.log` 输出，`fields.plugin = "cpa-plugin-codex-auto-reset"`，含触发判定（负向决策为 debug 级）、credit id、幂等键、结果码与清冷却结果，可事后审计 credit 消耗。
+全部经 `host.log` 输出，`fields.plugin = "cpa-plugin-codex-auto-reset"`，含触发判定（负向决策为 debug 级；`window_source` / `resets_source` 标明窗口与重置时长取自哪个字段）、credit id、幂等键、结果码与清冷却结果，可事后审计 credit 消耗。

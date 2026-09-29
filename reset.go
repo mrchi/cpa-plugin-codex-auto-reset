@@ -24,6 +24,10 @@ const (
 
 	creditStatusAvailable = "available"
 
+	// creditsListAttempts bounds the in-flow retries of the credit listing, the one
+	// read-only call a transient fault should not cost the flow.
+	creditsListAttempts = 3
+
 	// Consume result codes. The upstream enum is closed; anything else is treated as
 	// a failure that consumed nothing (D17).
 	consumeCodeReset           = "reset"
@@ -37,8 +41,6 @@ const (
 // Reset-flow log messages, one per outcome, so credit consumption stays auditable
 // after the fact (spec story 17).
 const (
-	reasonResetInFlight      = "auto-reset: reset already in flight: signal dropped"
-	reasonResetSuppressed    = "auto-reset: credential suppressed after a recent reset: signal dropped"
 	reasonAuthUnreadable     = "auto-reset: cannot read credential: no reset"
 	reasonNoAccessToken      = "auto-reset: credential carries no access token: no reset"
 	reasonUUIDFailed         = "auto-reset: cannot generate an idempotency key: no reset"
@@ -49,6 +51,7 @@ const (
 	reasonCooldownCleared    = "auto-reset: credential cooldown cleared"
 	reasonCooldownFailed     = "auto-reset: credential cooldown clear failed"
 	reasonManagementKeyEmpty = "auto-reset: management_key is not configured: no reset"
+	reasonNoAuthIndex        = "auto-reset: record carries no auth index: no reset"
 )
 
 // resetCreditsResponse is the GET payload. Unknown fields (the real response carries
@@ -77,119 +80,164 @@ type managementResetQuotaRequest struct {
 	AuthIndex string `json:"auth_index"`
 }
 
-// startReset dispatches the reset flow for one hit signal and returns immediately
+// creditsListRetryDelay is the pause before each listing retry. ponytail: fixed
+// delay, add backoff if upstream starts rate-limiting the retries. Tests zero it.
+var creditsListRetryDelay = time.Second
+
+// resetFlow is one run of the auto-reset flow for one usage record: the host it talks
+// through, the configuration it started with, and the record that triggered it.
+type resetFlow struct {
+	h      host
+	cfg    pluginConfig
+	record pluginapi.UsageRecord
+}
+
+// log writes one flow line carrying the credential identity (spec story 17).
+func (f resetFlow) log(level, reason string, extra map[string]any) {
+	f.h.log(level, reason, recordFields(f.record, extra))
+}
+
+// startAutoReset dispatches the reset flow for one hit signal and returns immediately
 // (D11); a signal arriving while a flow is running or inside the suppression window
 // is dropped with a debug log rather than queued (D12).
-func startReset(state *resetState, h host, cfg pluginConfig, record pluginapi.UsageRecord) {
+func startAutoReset(guard *debounce, h host, cfg pluginConfig, record pluginapi.UsageRecord) {
+	flow := resetFlow{h: h, cfg: cfg, record: record}
 	// Pre-flight: without a management key the cooldown can never be cleared, so a
 	// consumed credit would leave the credential locked until the old reset time and
 	// buy nothing. Stop before spending anything (spec story 16).
 	if strings.TrimSpace(cfg.ManagementKey) == "" {
-		h.log("warn", reasonManagementKeyEmpty, logFields(resetFields(record, nil)))
+		flow.log(levelWarn, reasonManagementKeyEmpty, nil)
 		return
 	}
-	if claimed, reason := state.begin(record.AuthIndex); !claimed {
-		h.log("debug", reason, logFields(resetFields(record, nil)))
+	// host.auth.get only resolves an auth index, and the debounce is keyed by it: a
+	// record without one can never be reset and must not share a debounce entry.
+	if record.AuthIndex == "" {
+		flow.log(levelWarn, reasonNoAuthIndex, nil)
 		return
 	}
-	// The goroutine captures this state, so a later reconfigure or test cannot
-	// redirect the flow's bookkeeping at another state object.
+	if claimed, reason := guard.begin(record.AuthIndex); !claimed {
+		flow.log(levelDebug, reason, nil)
+		return
+	}
+	// The goroutine captures this guard, so a later reconfigure or test cannot redirect
+	// the flow's bookkeeping at another debounce.
 	go func() {
-		state.finish(record.AuthIndex, runReset(h, cfg, record))
+		guard.finish(record.AuthIndex, flow.run())
 	}()
 }
 
-// runReset performs the whole flow: read the credential, list the account's reset
-// credits, consume the earliest-expiring available one, then clear CPA's cooldown. It
-// reports whether a credit was consumed. Every failure returns false without retrying
-// or compensating, leaving CPA's default cooldown in place (spec stories 6-16).
-func runReset(h host, cfg pluginConfig, record pluginapi.UsageRecord) bool {
-	auth, errAuth := h.authGet(record.AuthIndex)
+// run performs the whole flow: read the credential, list the account's reset credits,
+// consume the earliest-expiring available one, then clear CPA's cooldown. Every
+// failure stops the flow without compensating, leaving CPA's default cooldown in place
+// (spec stories 6-16).
+//
+// It reports whether the flow settled: whether its outcome is one a repeat within the
+// suppression window could not change. A spent credit, no credit to spend, a dead
+// token and a consume already sent are settled, so the stale 429 records still
+// arriving for this credential do not repeat the upstream calls. A transient fault
+// (the host, the listing after its retries) is not, and the next signal tries again.
+func (f resetFlow) run() bool {
+	auth, errAuth := f.h.authGet(f.record.AuthIndex)
 	if errAuth != nil {
-		h.log("warn", reasonAuthUnreadable, logFields(resetFields(record, map[string]any{"error": errAuth.Error()})))
+		f.log(levelWarn, reasonAuthUnreadable, map[string]any{"error": errAuth.Error()})
 		return false
 	}
 	creds := parseAuthCredentials(auth.JSON)
 	if creds.accessToken == "" {
-		h.log("warn", reasonNoAccessToken, logFields(resetFields(record, nil)))
-		return false
+		f.log(levelWarn, reasonNoAccessToken, nil)
+		return true
 	}
 
-	credit, okCredit := fetchResetCredit(h, creds, record)
+	credits, okList, tokenRejected := f.listCredits(creds)
+	if !okList {
+		return tokenRejected
+	}
+	credit, okCredit := pickCredit(credits)
 	if !okCredit {
-		return false
+		f.log(levelInfo, reasonNoAvailableCredit, map[string]any{"credits": len(credits)})
+		return true
 	}
 
 	// One idempotency key per flow, generated once and outside any retry, so a
 	// replayed consume can never burn a second credit (D18, spec story 8).
 	redeemID, errUUID := newUUIDv4()
 	if errUUID != nil {
-		h.log("warn", reasonUUIDFailed, logFields(resetFields(record, map[string]any{"error": errUUID.Error()})))
+		f.log(levelWarn, reasonUUIDFailed, map[string]any{"error": errUUID.Error()})
 		return false
 	}
 
-	code, okConsume := consumeResetCredit(h, creds, credit.ID, redeemID, record)
+	// Once a consume is sent the credit may be gone whatever came back, so every
+	// consume outcome settles the flow: a second flow could spend a second credit.
+	code, okConsume := f.consume(creds, credit.ID, redeemID)
 	if !okConsume {
-		return false
+		return true
 	}
-	h.log("info", reasonResetSucceeded, logFields(resetFields(record, map[string]any{
+	f.log(levelInfo, reasonResetSucceeded, map[string]any{
 		"credit_id":         credit.ID,
 		"code":              code,
 		"redeem_request_id": redeemID,
-	})))
+	})
 
-	clearCooldown(h, cfg, record)
+	f.clearCooldown()
 	return true
 }
 
-// fetchResetCredit lists the account's credits and picks the one to spend. A listing
-// that cannot be read or holds nothing available aborts the flow; no consume is sent.
-func fetchResetCredit(h host, creds authCredentials, record pluginapi.UsageRecord) (resetCredit, bool) {
-	response, errDo := h.httpDo(httpRequest{
-		Method:  http.MethodGet,
-		URL:     codexBaseURL + resetCreditsPath,
-		Headers: upstreamHeaders(creds, false),
-	})
-	if errDo != nil {
-		h.log("warn", reasonCreditsListFailed, logFields(resetFields(record, map[string]any{"error": errDo.Error()})))
-		return resetCredit{}, false
+// listCredits fetches the account's reset credits. A 401 or 403 means the stored
+// token is rejected, which no retry fixes (D21), so it fails at once with
+// tokenRejected set; any other failure is retried up to creditsListAttempts times.
+// Either way a failed listing is logged once and no consume is sent.
+func (f resetFlow) listCredits(creds authCredentials) (credits []resetCredit, ok, tokenRejected bool) {
+	var failure map[string]any
+	for attempt := 1; attempt <= creditsListAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(creditsListRetryDelay)
+		}
+		response, errDo := f.h.httpDo(httpRequest{
+			Method:  http.MethodGet,
+			URL:     codexBaseURL + resetCreditsPath,
+			Headers: upstreamHeaders(creds, false),
+		})
+		if errDo != nil {
+			failure = map[string]any{"error": errDo.Error()}
+			continue
+		}
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			f.log(levelWarn, reasonCreditsListFailed, map[string]any{"status_code": response.StatusCode, "attempts": attempt})
+			return nil, false, true
+		}
+		if !isSuccessStatus(response.StatusCode) {
+			failure = map[string]any{"status_code": response.StatusCode}
+			continue
+		}
+		var listing resetCreditsResponse
+		if errUnmarshal := json.Unmarshal(response.Body, &listing); errUnmarshal != nil {
+			failure = map[string]any{"error": errUnmarshal.Error()}
+			continue
+		}
+		return listing.Credits, true, false
 	}
-	if !isSuccessStatus(response.StatusCode) {
-		h.log("warn", reasonCreditsListFailed, logFields(resetFields(record, map[string]any{"status_code": response.StatusCode})))
-		return resetCredit{}, false
-	}
-	var listing resetCreditsResponse
-	if errUnmarshal := json.Unmarshal(response.Body, &listing); errUnmarshal != nil {
-		h.log("warn", reasonCreditsListFailed, logFields(resetFields(record, map[string]any{"error": errUnmarshal.Error()})))
-		return resetCredit{}, false
-	}
-	credit, okCredit := pickCredit(listing.Credits)
-	if !okCredit {
-		h.log("info", reasonNoAvailableCredit, logFields(resetFields(record, map[string]any{
-			"credits": len(listing.Credits),
-		})))
-		return resetCredit{}, false
-	}
-	return credit, true
+	failure["attempts"] = creditsListAttempts
+	f.log(levelWarn, reasonCreditsListFailed, failure)
+	return nil, false, false
 }
 
-// consumeResetCredit redeems one credit by id. Only reset and already_redeemed mean
-// the credit is gone; nothing_to_reset, no_credit (both HTTP 200), any other code and
-// every non-2xx status are failures that consumed nothing (D17).
-func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string, record pluginapi.UsageRecord) (string, bool) {
+// consume redeems one credit by id. Only reset and already_redeemed mean the credit is
+// gone; nothing_to_reset, no_credit (both HTTP 200), any other code and every non-2xx
+// status are failures that consumed nothing (D17).
+func (f resetFlow) consume(creds authCredentials, creditID, redeemID string) (string, bool) {
 	fields := map[string]any{"credit_id": creditID, "redeem_request_id": redeemID}
 	// fail adds the one detail that explains this attempt and writes the single line
 	// the flow logs for it, so no branch can fail silently (spec story 17).
 	fail := func(key string, detail any) (string, bool) {
 		fields[key] = detail
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
+		f.log(levelWarn, reasonConsumeFailed, fields)
 		return "", false
 	}
 	body, errMarshal := json.Marshal(consumeRequest{RedeemRequestID: redeemID, CreditID: creditID})
 	if errMarshal != nil {
 		return fail("error", errMarshal.Error())
 	}
-	response, errDo := h.httpDo(httpRequest{
+	response, errDo := f.h.httpDo(httpRequest{
 		Method:  http.MethodPost,
 		URL:     codexBaseURL + resetConsumePath,
 		Headers: upstreamHeaders(creds, true),
@@ -222,31 +270,31 @@ func isSuccessStatus(status int) bool {
 // clearCooldown asks CPA's management API to drop the credential's cooldown, so the
 // restored quota is schedulable again (D19, spec story 11). It runs only after a
 // credited consume and never retries: a failure is logged and the flow ends. A blank
-// key never reaches here — startReset stops the flow before it spends anything.
-func clearCooldown(h host, cfg pluginConfig, record pluginapi.UsageRecord) {
-	body, errMarshal := json.Marshal(managementResetQuotaRequest{AuthIndex: record.AuthIndex})
+// key never reaches here — startAutoReset stops the flow before it spends anything.
+func (f resetFlow) clearCooldown() {
+	body, errMarshal := json.Marshal(managementResetQuotaRequest{AuthIndex: f.record.AuthIndex})
 	if errMarshal != nil {
-		h.log("warn", reasonCooldownFailed, logFields(resetFields(record, map[string]any{"error": errMarshal.Error()})))
+		f.log(levelWarn, reasonCooldownFailed, map[string]any{"error": errMarshal.Error()})
 		return
 	}
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+cfg.ManagementKey)
+	headers.Set("Authorization", "Bearer "+f.cfg.ManagementKey)
 	headers.Set("Content-Type", "application/json")
-	response, errDo := h.httpDo(httpRequest{
+	response, errDo := f.h.httpDo(httpRequest{
 		Method:  http.MethodPost,
-		URL:     strings.TrimRight(cfg.ManagementBaseURL, "/") + managementResetQuotaPath,
+		URL:     strings.TrimRight(f.cfg.ManagementBaseURL, "/") + managementResetQuotaPath,
 		Headers: headers,
 		Body:    body,
 	})
 	if errDo != nil {
-		h.log("warn", reasonCooldownFailed, logFields(resetFields(record, map[string]any{"error": errDo.Error()})))
+		f.log(levelWarn, reasonCooldownFailed, map[string]any{"error": errDo.Error()})
 		return
 	}
 	if response.StatusCode != http.StatusOK {
-		h.log("warn", reasonCooldownFailed, logFields(resetFields(record, map[string]any{"status_code": response.StatusCode})))
+		f.log(levelWarn, reasonCooldownFailed, map[string]any{"status_code": response.StatusCode})
 		return
 	}
-	h.log("info", reasonCooldownCleared, logFields(resetFields(record, nil)))
+	f.log(levelInfo, reasonCooldownCleared, nil)
 }
 
 // creditExpiry is a credit's expires_at as parsed: Dated is false for a null or
@@ -386,13 +434,4 @@ func newUUIDv4() (string, error) {
 	raw[6] = (raw[6] & 0x0f) | 0x40
 	raw[8] = (raw[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
-}
-
-// resetFields carries the credential identity on every log line of the flow.
-func resetFields(record pluginapi.UsageRecord, extra map[string]any) map[string]any {
-	fields := map[string]any{"auth_id": record.AuthID, "auth_index": record.AuthIndex}
-	for key, value := range extra {
-		fields[key] = value
-	}
-	return fields
 }

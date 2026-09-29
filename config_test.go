@@ -10,7 +10,7 @@ import (
 
 func lifecyclePayload(t *testing.T, configYAML string) []byte {
 	t.Helper()
-	raw, errMarshal := json.Marshal(lifecycleRequest{ConfigYAML: []byte(configYAML), SchemaVersion: 6})
+	raw, errMarshal := json.Marshal(map[string]any{"config_yaml": []byte(configYAML), "schema_version": 6})
 	if errMarshal != nil {
 		t.Fatalf("marshal lifecycle request: %v", errMarshal)
 	}

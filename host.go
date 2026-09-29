@@ -68,13 +68,29 @@ func (cgoHost) httpDo(request httpRequest) (pluginapi.HTTPResponse, error) {
 	return response, errCall
 }
 
+// Log levels host.log recognises, plus levelDebug, which it maps to debug by not
+// recognising it (D13). Named so a typo cannot silently demote a line to debug.
+const (
+	levelDebug = "debug"
+	levelInfo  = "info"
+	levelWarn  = "warn"
+)
+
 // logFields tags every record with the plugin id: the host only adds request_id, so
 // records are otherwise unattributable (D13).
 func logFields(extra map[string]any) map[string]any {
-	fields := make(map[string]any, len(extra)+1)
+	fields := make(map[string]any, len(extra)+3)
 	fields["plugin"] = pluginID
 	for key, value := range extra {
 		fields[key] = value
 	}
+	return fields
+}
+
+// recordFields is logFields plus the credential identity every per-record line carries.
+func recordFields(record pluginapi.UsageRecord, extra map[string]any) map[string]any {
+	fields := logFields(extra)
+	fields["auth_id"] = record.AuthID
+	fields["auth_index"] = record.AuthIndex
 	return fields
 }

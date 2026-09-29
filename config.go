@@ -14,11 +14,9 @@ const (
 )
 
 // lifecycleRequest is the register/reconfigure payload; ConfigYAML arrives base64
-// encoded because it is a []byte (D8). schema_version is decoded only to keep the wire
-// shape visible: this plugin advertises version 1 and reads no behaviour from it.
+// encoded because it is a []byte (D8).
 type lifecycleRequest struct {
-	ConfigYAML    []byte `json:"config_yaml"`
-	SchemaVersion uint32 `json:"schema_version"`
+	ConfigYAML []byte `json:"config_yaml"`
 }
 
 // pluginConfig mirrors plugins.configs.cpa-plugin-codex-auto-reset. The host injects `enabled`
@@ -48,7 +46,7 @@ func parseConfig(h host, request []byte) pluginConfig {
 	}
 	var req lifecycleRequest
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
-		h.log("warn", "invalid lifecycle request, using default config: "+errUnmarshal.Error(), logFields(nil))
+		h.log(levelWarn, "invalid lifecycle request, using default config: "+errUnmarshal.Error(), logFields(nil))
 		return defaultConfig()
 	}
 	if len(req.ConfigYAML) == 0 {
@@ -56,7 +54,7 @@ func parseConfig(h host, request []byte) pluginConfig {
 	}
 	cfg := defaultConfig()
 	if errUnmarshal := yaml.Unmarshal(req.ConfigYAML, &cfg); errUnmarshal != nil {
-		h.log("warn", "invalid config yaml, using default config: "+errUnmarshal.Error(), logFields(nil))
+		h.log(levelWarn, "invalid config yaml, using default config: "+errUnmarshal.Error(), logFields(nil))
 		return defaultConfig()
 	}
 	cfg.ManagementBaseURL = strings.TrimSpace(cfg.ManagementBaseURL)

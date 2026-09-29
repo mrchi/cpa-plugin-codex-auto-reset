@@ -437,16 +437,22 @@ func TestResetConsumeOutcomes(t *testing.T) {
 	}
 }
 
-func TestResetListingFailuresAbortTheFlow(t *testing.T) {
+// TestResetListingFailures pins how a failed credit listing ends the flow: an expired
+// or rejected token (401/403) is final, anything else is retried inside the flow a
+// bounded number of times before giving up.
+func TestResetListingFailures(t *testing.T) {
 	tests := []struct {
 		name      string
 		status    int
 		body      string
 		transport bool
+		wantCalls int
 	}{
-		{name: "a non-2xx listing is a failure", status: http.StatusForbidden, body: `{"error":"forbidden"}`},
-		{name: "an unparsable listing is a failure", status: http.StatusOK, body: `not json`},
-		{name: "a transport error is a failure", transport: true},
+		{name: "a 401 is final", status: http.StatusUnauthorized, wantCalls: 1},
+		{name: "a 403 is final", status: http.StatusForbidden, body: `{"error":"forbidden"}`, wantCalls: 1},
+		{name: "a 500 is retried", status: http.StatusInternalServerError, wantCalls: creditsListAttempts},
+		{name: "an unparsable listing is retried", status: http.StatusOK, body: `not json`, wantCalls: creditsListAttempts},
+		{name: "a transport error is retried", transport: true, wantCalls: creditsListAttempts},
 	}
 
 	for _, test := range tests {
@@ -461,13 +467,139 @@ func TestResetListingFailuresAbortTheFlow(t *testing.T) {
 
 			driveHit(t, fake, managementConfigYAML, reasonCreditsListFailed, hitRecord())
 
-			if got := fake.requestCount(); got != 1 {
-				t.Fatalf("http.do calls = %d, want only the listing", got)
+			if got := fake.requestCount(); got != test.wantCalls {
+				t.Fatalf("http.do calls = %d, want %d listing attempts and nothing else", got, test.wantCalls)
 			}
 			if got := logsWithMessage(fake.logged(), reasonCreditsListFailed); len(got) != 1 {
 				t.Errorf("listing-failure logs = %+v, want one", got)
 			}
 		})
+	}
+}
+
+func TestResetListingRecoversOnRetry(t *testing.T) {
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+	var listings int
+	fake.httpHandler = func(request httpRequest) (pluginapi.HTTPResponse, error) {
+		if request.URL == creditsURL {
+			fake.mu.Lock()
+			listings++
+			first := listings == 1
+			fake.mu.Unlock()
+			if first {
+				return pluginapi.HTTPResponse{}, errFakeTransport
+			}
+		}
+		return fake.answer(request)
+	}
+
+	driveHit(t, fake, managementConfigYAML, reasonCooldownCleared, hitRecord())
+
+	if got := len(fake.requestsFor(http.MethodGet, creditsURL)); got != 2 {
+		t.Errorf("listing requests = %d, want the failed one and one retry", got)
+	}
+	consumedCredit(t, fake)
+}
+
+// TestFlowOutcomeDecidesSuppression pins which finished flows silence the credential
+// for the suppression window. A flow whose outcome a quick repeat cannot change (a
+// credit spent, none to spend, a dead token, a consume already sent) is suppressed, so
+// the stale 429 records that keep arriving do not repeat the upstream calls. A flow
+// that stopped on a transient fault stays eligible for the next signal.
+func TestFlowOutcomeDecidesSuppression(t *testing.T) {
+	tests := []struct {
+		name           string
+		arrange        func(*fakeHost)
+		lastLog        string
+		wantSuppressed bool
+	}{
+		{
+			name:           "no available credit",
+			arrange:        func(f *fakeHost) { f.script(http.MethodGet, creditsURL, http.StatusOK, creditsBody("")) },
+			lastLog:        reasonNoAvailableCredit,
+			wantSuppressed: true,
+		},
+		{
+			name:           "consume answers no_credit",
+			arrange:        func(f *fakeHost) { f.script(http.MethodPost, consumeURL, http.StatusOK, `{"code":"no_credit"}`) },
+			lastLog:        reasonConsumeFailed,
+			wantSuppressed: true,
+		},
+		{
+			name:           "consume outcome unknown",
+			arrange:        func(f *fakeHost) { f.scriptFailure(http.MethodPost, consumeURL, errFakeTransport) },
+			lastLog:        reasonConsumeFailed,
+			wantSuppressed: true,
+		},
+		{
+			name:           "credential has no access token",
+			arrange:        func(f *fakeHost) { f.withCredential(authIndex, `{"account_id":"acct-1"}`) },
+			lastLog:        reasonNoAccessToken,
+			wantSuppressed: true,
+		},
+		{
+			name:           "token rejected by the listing",
+			arrange:        func(f *fakeHost) { f.script(http.MethodGet, creditsURL, http.StatusUnauthorized, "") },
+			lastLog:        reasonCreditsListFailed,
+			wantSuppressed: true,
+		},
+		{
+			name:    "listing keeps failing",
+			arrange: func(f *fakeHost) { f.scriptFailure(http.MethodGet, creditsURL, errFakeTransport) },
+			lastLog: reasonCreditsListFailed,
+		},
+		{
+			name:    "credential cannot be read",
+			arrange: func(f *fakeHost) { f.auths = map[string]pluginapi.HostAuthGetResponse{} },
+			lastLog: reasonAuthUnreadable,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			useFakeClock(t, testClock)
+			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+			test.arrange(fake)
+			driveHit(t, fake, managementConfigYAML, test.lastLog, hitRecord())
+
+			if test.wantSuppressed {
+				waitForSuppressed(t, fake, hitRecord())
+				if got := len(fake.authGetCalls()); got != 1 {
+					t.Errorf("auth.get calls = %d, want the first flow only", got)
+				}
+				return
+			}
+			// Keep signalling until a second flow starts; a suppressed credential never would.
+			waitFor(t, func() bool {
+				if len(fake.authGetCalls()) >= 2 {
+					return true
+				}
+				sendUsage(t, fake, hitRecord())
+				return false
+			})
+			if got := logsWithMessage(fake.logged(), reasonResetSuppressed); len(got) != 0 {
+				t.Errorf("suppression drops = %+v, want none after a transient failure", got)
+			}
+		})
+	}
+}
+
+// TestBlankAuthIndexNeverStartsAFlow pins that a record without an auth index, which
+// host.auth.get cannot resolve and the debounce cannot key, is dropped before any call.
+func TestBlankAuthIndexNeverStartsAFlow(t *testing.T) {
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+	record := hitRecord()
+	record.AuthIndex = ""
+
+	driveHit(t, fake, managementConfigYAML, reasonNoAuthIndex, record)
+
+	if got := len(fake.authGetCalls()); got != 0 {
+		t.Errorf("auth.get calls = %d, want none", got)
+	}
+	if got := fake.requestCount(); got != 0 {
+		t.Errorf("http.do calls = %d, want none", got)
 	}
 }
 

@@ -32,7 +32,8 @@
 - D24 触发时长的来源有两个：错误体的 `resets_in_seconds`（正整数优先）与 `resets_at`。**`resets_at` 的真实格式是整数 Unix 秒**（openai/codex 的 wire struct 建模为 `i64`，CPA 自己用 `quota.Get("resets_at").Int()` 读，fixture 形如 `"resets_at":1700000300`）；旧报文里出现过 RFC3339 字符串，所以两种都接受，非正数与解析失败一律视为没有该字段。`resets_in_seconds` 缺失或非正数时用 `resets_at - 当前时间` 推算秒数；两者都取不到（或推算结果非正）才算"未知窗"不命中。**不能只认 `resets_in_seconds`**：缺失时整条记录不命中，失败模式是"功能静默永不生效"而非降级。窗口兜底判定不变（`limit_window_minutes` 缺失时 `>18000`），但输入用推算后的秒数。`limit_window_minutes` 字段本身已被一手来源证实存在（openai/codex `api_bridge.rs` 的 `UsageErrorBody`，单位为分钟），`== 10080` 的用法成立。
 - D12 并发控制用内存态 `map[authIndex]credentialState{inFlight bool, suppressedUntil time.Time}` + 一把 `sync.Mutex`，**不持久化**：
   - 收到命中信号时若 `inFlight` 或 `now < suppressedUntil` → 记 debug 日志后直接丢弃（不做阻塞等待，避免 goroutine 堆积）。两种丢弃各记各的日志文案，日志里能区分"流程进行中"与"刚重置过"。
-  - 否则置 `inFlight`，起 goroutine；流程结束清 `inFlight`，成功时置 `suppressedUntil = now + 5m`
+  - 否则置 `inFlight`，起 goroutine；流程结束清 `inFlight`，流程**有定论**时置 `suppressedUntil = now + 5m`。有定论 = 5 分钟内重来结果也不会变：credit 已消耗、无可用 credit、token 失效（无 access token 或列表 401/403）、consume 已发出（不论返回什么——结果未知时重来可能烧第二张卡）。临时故障（`host.auth.get` 失败、列表重试耗尽、UUID 生成失败）不抑制，下一条信号可重试。
+  - `AuthIndex` 为空的记录直接 warn 丢弃：`host.auth.get` 只认 auth index，也不能让这类记录共用一个 debounce 条目。
 - D25 时间来源只有一个：`state.go` 的进程时钟（`now()` 读、`setClock()` 换）。debounce 抑制窗口、credit 过期判断与 `resets_at` 推算全部读它；测试用 `useFakeClock` 换成假时钟推进时间，不依赖真实时钟、也不真的等 5 分钟。时钟会被重置流程的 goroutine 读取（D11），所以换表加锁。
 - D13 host 调用统一经一个接缝接口（ticket 01 建立），生产实现走 C 回调，测试用 fake。`host.log` 的 level 只认 `trace`/`info`/`warn`/`error`，其它值（含 `debug`）落到 debug 级别；`fields` 固定带 `{"plugin":"cpa-plugin-codex-auto-reset"}`（host 不自动补插件标识）。
 
@@ -42,7 +43,7 @@
 - D15 必需 header：`Authorization: Bearer <access_token>`、`ChatGPT-Account-ID: <account_id>`、POST 加 `Content-Type: application/json`，另带 `User-Agent: codex_cli_rs/<ver>` 与 `originator: codex_cli_rs`。官方不发 `OpenAI-Beta`，不要加。
 - D16 `GET /wham/rate-limit-reset-credits` → 顶层 `credits[]`（元素主键是 **`id`**，**不是 `credit_id`**；另有 `status` / `expires_at`，`expires_at` 是 RFC3339 字符串或 `null`）。选 available 且 `expires_at` 最早者；`expires_at` 早于当前时间（或正好等于）的 credit **跳过**——消耗它只会换回一个 `no_credit`，让流程白白放弃旁边可用的 credit；`expires_at` 为 null 或解析失败视为永不过期排最后。解析必须容忍未知字段（真实响应字段多于官方 struct）。
 - D17 `POST /wham/rate-limit-reset-credits/consume`，body `{"redeem_request_id":"<uuid v4>","credit_id":"<id>"}`（`credit_id` 是 **string**）。响应 `code` ∈ `reset` / `already_redeemed` / `nothing_to_reset` / `no_credit`。非 2xx 一律硬失败。`no_credit` / `nothing_to_reset` 是 **200 + code**，不是 4xx。
-- D18 幂等键：一次流程内重试复用同一 `redeem_request_id`；新触发（过抑制期后）生成新的。（本实现每流程只发一次 consume，无内部重试，但幂等键必须由流程级生成，不得写在循环里。）
+- D18 幂等键：一次流程内重试复用同一 `redeem_request_id`；新触发（过抑制期后）生成新的。（本实现每流程只发一次 consume，无内部重试，但幂等键必须由流程级生成，不得写在循环里。只读的 credits 列表可以重试：401/403 视为 token 失效直接结束，其它失败最多共试 3 次，间隔 1s。）
 - D19 清冷却：`POST {management_base_url}/v0/management/reset-quota`，header `Authorization: Bearer <management_key>`，body `{"auth_index":"<authIndex>"}`（**是 auth_index 不是 auth id**），200 视为成功。仅在 consume 成功后调用；失败只记日志、不重试。
 
 ## 已知取舍（显式记录，不要"顺手修"）

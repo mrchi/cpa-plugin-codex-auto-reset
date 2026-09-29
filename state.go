@@ -29,64 +29,71 @@ func setClock(read func() time.Time) func() {
 	return func() { setClock(previous) }
 }
 
-// resetSuppressWindow is how long a credential is left alone after a credit was
-// consumed: in-flight failure records from the requests that raced the reset would
-// otherwise trigger a second, pointless consume (D12, spec story 14).
+// resetSuppressWindow is how long a credential is left alone after a settled flow:
+// in-flight failure records from the requests that raced it would otherwise repeat a
+// consume, or the upstream calls that just established there is nothing to do
+// (D12, spec story 14).
 const resetSuppressWindow = 5 * time.Minute
 
-// resetState is the in-process debounce for the reset flow, keyed by auth index. It
-// is deliberately not persisted: a restart forgets it, which costs at most one extra
+// The two reasons a signal is dropped, kept apart so the host log can tell a flow
+// already running (spec story 13) from a credential inside its suppression window
+// (spec story 14).
+const (
+	reasonResetInFlight   = "auto-reset: reset already in flight: signal dropped"
+	reasonResetSuppressed = "auto-reset: credential suppressed after a recent reset: signal dropped"
+)
+
+// debounce is the in-process guard for the reset flow, keyed by auth index. It is
+// deliberately not persisted: a restart forgets it, which costs at most one extra
 // suppressed opportunity to reset (D12).
-type resetState struct {
-	mu    sync.Mutex
-	slots map[string]*credentialSlot
+type debounce struct {
+	mu     sync.Mutex
+	states map[string]*credentialState
 }
 
-// credentialSlot is one credential's debounce slot: whether a flow is running for it
-// and, if a credit was just consumed, until when further signals are ignored.
-type credentialSlot struct {
+// credentialState is one credential's debounce entry: whether a flow is running for it
+// and until when further signals are ignored.
+type credentialState struct {
 	inFlight        bool
 	suppressedUntil time.Time
 }
 
-func newResetState() *resetState {
-	return &resetState{slots: map[string]*credentialSlot{}}
+func newDebounce() *debounce {
+	return &debounce{states: map[string]*credentialState{}}
 }
 
-// begin claims the reset slot for one credential. When it cannot, the returned reason
-// is the log message explaining the drop, so the two cases stay distinguishable in the
-// host log: a flow already running (spec story 13) versus a credential still inside
-// its post-reset suppression window (spec story 14). The caller drops the signal
-// instead of waiting, so goroutines cannot pile up (D12).
-func (s *resetState) begin(authIndex string) (bool, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	slot := s.slots[authIndex]
-	if slot == nil {
-		slot = &credentialSlot{}
-		s.slots[authIndex] = slot
+// begin claims the credential for one flow. When it cannot, the returned reason is the
+// log line explaining the drop. The caller drops the signal instead of waiting, so
+// goroutines cannot pile up (D12).
+func (d *debounce) begin(authIndex string) (bool, string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	state := d.states[authIndex]
+	if state == nil {
+		state = &credentialState{}
+		d.states[authIndex] = state
 	}
-	if slot.inFlight {
+	if state.inFlight {
 		return false, reasonResetInFlight
 	}
-	if now().Before(slot.suppressedUntil) {
+	if now().Before(state.suppressedUntil) {
 		return false, reasonResetSuppressed
 	}
-	slot.inFlight = true
+	state.inFlight = true
 	return true, ""
 }
 
-// finish releases the slot and, when a credit was consumed, suppresses the credential
+// finish releases the credential and, when the flow settled its outcome, suppresses it
 // for the configured window.
-func (s *resetState) finish(authIndex string, consumed bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	slot := s.slots[authIndex]
-	if slot == nil {
+func (d *debounce) finish(authIndex string, settled bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	state := d.states[authIndex]
+	if state == nil {
 		return
 	}
-	slot.inFlight = false
-	if consumed {
-		slot.suppressedUntil = now().Add(resetSuppressWindow)
+	state.inFlight = false
+	if settled {
+		state.suppressedUntil = now().Add(resetSuppressWindow)
 	}
 }

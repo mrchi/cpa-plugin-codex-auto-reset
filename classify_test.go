@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -407,6 +408,55 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			if got := fake.authGetCalls(); len(got) != 0 {
 				t.Errorf("auth.get calls = %v, want none", got)
 			}
+		})
+	}
+}
+
+// TestDecisionLogNamesItsSources pins the audit trail (spec story 17): the log says
+// where the window came from and where the reset timing came from, so a resets_at
+// derivation is never reported as an upstream resets_in_seconds.
+func TestDecisionLogNamesItsSources(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       func(at time.Time) string
+		wantWindow string
+		wantResets string
+	}{
+		{
+			name:       "explicit window and resets_in_seconds",
+			body:       func(time.Time) string { return hitBody() },
+			wantWindow: "limit_window_minutes",
+			wantResets: "resets_in_seconds",
+		},
+		{
+			name:       "explicit window and resets_at",
+			body:       func(at time.Time) string { return resetsAtBody(at.Add(200000 * time.Second)) },
+			wantWindow: "limit_window_minutes",
+			wantResets: "resets_at",
+		},
+		{
+			name: "fallback window from resets_at",
+			body: func(at time.Time) string {
+				return timingOnlyBody(`"resets_at":` + strconv.FormatInt(at.Add(200000*time.Second).Unix(), 10))
+			},
+			wantWindow: "reset_timing",
+			wantResets: "resets_at",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := useFakeClock(t, testClock)
+			fake := newFakeHost()
+			registerConfig(t, fake, "enabled: true\n")
+			sendUsage(t, fake, usageRecord(test.body(clock.now())))
+			entry := waitForLog(t, fake, reasonHit)
+			if entry.Fields["window_source"] != test.wantWindow {
+				t.Errorf("window_source = %v, want %q", entry.Fields["window_source"], test.wantWindow)
+			}
+			if entry.Fields["resets_source"] != test.wantResets {
+				t.Errorf("resets_source = %v, want %q", entry.Fields["resets_source"], test.wantResets)
+			}
+			waitForLog(t, fake, reasonManagementKeyEmpty)
 		})
 	}
 }
