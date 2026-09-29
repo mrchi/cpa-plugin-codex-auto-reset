@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -281,8 +282,10 @@ func weeklyBodyWith(fields string) string {
 
 // resetsAtBody renders a weekly-window body whose only timing is a resets_at
 // timestamp at the given instant, the shape that has no resets_in_seconds at all.
+// The upstream body carries resets_at as integer Unix seconds, so the fixture does too;
+// the legacy RFC3339-string shape is covered by the inline case in classify_test.go.
 func resetsAtBody(at time.Time) string {
-	return weeklyBodyWith(`"resets_at":"` + at.UTC().Format(time.RFC3339) + `"`)
+	return weeklyBodyWith(`"resets_at":` + strconv.FormatInt(at.Unix(), 10))
 }
 
 // timingOnlyBody renders a usage_limit_reached body with no window field at all, so

@@ -29,7 +29,7 @@
 
 - D10 `usage.handle` 输入是 `pluginapi.UsageRecord`。codex 订阅凭证判定：`Provider == "codex"` && `AuthType == "oauth"`。失败判定：`Failed == true` && `Failure.StatusCode == 429` && `Failure.Body`（字符串，上游错误体原文）中 `error.type == "usage_limit_reached"`。
 - D11 **`usage.handle` 必须立即返回**，重置流程放到独立 goroutine。理由：host 的 usage 派发是单 worker 队列，且 `host.http.do` 无超时字段、无 ctx deadline——在 handler 里同步做 HTTP 会阻塞 CPA 的整条 usage 队列。
-- D24 触发时长的来源有两个：错误体的 `resets_in_seconds`（正整数优先）与 `resets_at`（RFC3339 字符串，错误体同时携带）。`resets_in_seconds` 缺失或非正数时用 `resets_at - 当前时间` 推算秒数；两者都取不到（或推算结果非正）才算"未知窗"不命中。**不能只认 `resets_in_seconds`**：缺失时整条记录不命中，失败模式是"功能静默永不生效"而非降级。窗口兜底判定不变（`limit_window_minutes` 缺失时 `>18000`），但输入用推算后的秒数。
+- D24 触发时长的来源有两个：错误体的 `resets_in_seconds`（正整数优先）与 `resets_at`。**`resets_at` 的真实格式是整数 Unix 秒**（openai/codex 的 wire struct 建模为 `i64`，CPA 自己用 `quota.Get("resets_at").Int()` 读，fixture 形如 `"resets_at":1700000300`）；旧报文里出现过 RFC3339 字符串，所以两种都接受，非正数与解析失败一律视为没有该字段。`resets_in_seconds` 缺失或非正数时用 `resets_at - 当前时间` 推算秒数；两者都取不到（或推算结果非正）才算"未知窗"不命中。**不能只认 `resets_in_seconds`**：缺失时整条记录不命中，失败模式是"功能静默永不生效"而非降级。窗口兜底判定不变（`limit_window_minutes` 缺失时 `>18000`），但输入用推算后的秒数。`limit_window_minutes` 字段本身已被一手来源证实存在（openai/codex `api_bridge.rs` 的 `UsageErrorBody`，单位为分钟），`== 10080` 的用法成立。
 - D12 并发控制用内存态 `map[authIndex]credentialState{inFlight bool, suppressedUntil time.Time}` + 一把 `sync.Mutex`，**不持久化**：
   - 收到命中信号时若 `inFlight` 或 `now < suppressedUntil` → 记 debug 日志后直接丢弃（不做阻塞等待，避免 goroutine 堆积）。两种丢弃各记各的日志文案，日志里能区分"流程进行中"与"刚重置过"。
   - 否则置 `inFlight`，起 goroutine；流程结束清 `inFlight`，成功时置 `suppressedUntil = now + 5m`

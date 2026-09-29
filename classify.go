@@ -212,8 +212,18 @@ func bodyInt64(raw json.RawMessage) (int64, bool) {
 	return int64(number), true
 }
 
-// bodyTime reads an RFC3339 string field such as resets_at.
+// bodyTime reads a resets_at field, which upstream sends as integer Unix seconds
+// (openai/codex models it as i64 and CPA reads it with .Int()). Older bodies carry an
+// RFC3339 string instead, so both shapes are accepted. A non-positive or absent value
+// is not a usable timestamp.
 func bodyTime(raw json.RawMessage) (time.Time, bool) {
+	var seconds int64
+	if errUnmarshal := json.Unmarshal(raw, &seconds); errUnmarshal == nil {
+		if seconds <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(seconds, 0).UTC(), true
+	}
 	var text string
 	if errUnmarshal := json.Unmarshal(raw, &text); errUnmarshal != nil {
 		return time.Time{}, false
