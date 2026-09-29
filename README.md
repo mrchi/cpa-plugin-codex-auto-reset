@@ -1,4 +1,4 @@
-# cpa-auto-reset
+# cpa-plugin-codex-auto-reset
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 插件：当 codex 订阅渠道的**周用量窗口**用尽、且账号持有 reset credit 时，自动消耗一张 credit 重置限额并清除 CPA 对该凭证的本地冷却，无需人工介入。
 
@@ -22,21 +22,21 @@
 ## 构建
 
 ```bash
-make build          # 产出 dist/cpa-auto-reset.dylib（linux 为 .so）
+make build          # 产出 dist/cpa-plugin-codex-auto-reset.dylib（linux 为 .so）
 ```
 
 产物放到 CPA 的 `plugins/`（或 `plugins/<goos>/<goarch>/`）目录，文件名即插件 id。
 
 ## 配置
 
-`plugins.configs.cpa-auto-reset` 下的键：
+`plugins.configs.cpa-plugin-codex-auto-reset` 下的键：
 
 ```yaml
 plugins:
   enabled: true
   dir: "plugins"
   configs:
-    cpa-auto-reset:
+    cpa-plugin-codex-auto-reset:
       enabled: true                          # 总开关；缺失视为 true
       management_key: "<CPA management key>"  # 清冷却必需，缺失则跳过清冷却并记 warn
       management_base_url: "http://127.0.0.1:8317"  # 默认值
@@ -49,10 +49,12 @@ plugins:
 
 ## 已知上限
 
+- 上游 `chatgpt.com/backend-api` 的 reset credit 接口是**非官方接口**，契约可能随时变更；接口用法由多个开源项目在生产环境验证过。
 - `host.http.do` 无超时可设，上游挂死会占住该凭证的 reset 流程（不影响 CPA 自身的 usage 队列）；代码中以 `ponytail:` 注释标注。
 - 不刷新 access token：token 过期即视为一次失败，回落默认行为。
 - 5 小时窗用尽不触发。
+- 需要配置 `management_key`（CPA 的 `management.secret-key`），这是相对"只在 credit 快过期时兑换"类插件的额外运维负担——换来的是凭证冷却能被清掉、渠道立刻恢复可用。
 
 ## 日志
 
-全部经 `host.log` 输出，`fields.plugin = "cpa-auto-reset"`，含触发判定（负向决策为 debug 级）、credit id、幂等键、结果码与清冷却结果，可事后审计 credit 消耗。
+全部经 `host.log` 输出，`fields.plugin = "cpa-plugin-codex-auto-reset"`，含触发判定（负向决策为 debug 级）、credit id、幂等键、结果码与清冷却结果，可事后审计 credit 消耗。

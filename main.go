@@ -1,4 +1,4 @@
-// cpa-auto-reset is a CLIProxyAPI plugin, built as a c-shared library and loaded
+// cpa-plugin-codex-auto-reset is a CLIProxyAPI plugin, built as a c-shared library and loaded
 // from CPA's plugins directory.
 package main
 
@@ -67,7 +67,7 @@ import (
 const (
 	pluginVersion = "0.1.0"
 	pluginAuthor  = "mrchi"
-	pluginRepo    = "https://github.com/mrchi/cpa-auto-reset"
+	pluginRepo    = "https://github.com/mrchi/cpa-plugin-codex-auto-reset"
 
 	// The host accepts any schema version up to pluginabi.SchemaVersion (6); this
 	// plugin only relies on version 1 behaviours, so it advertises that.

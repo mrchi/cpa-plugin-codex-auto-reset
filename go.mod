@@ -1,4 +1,4 @@
-module github.com/mrchi/cpa-auto-reset
+module github.com/mrchi/cpa-plugin-codex-auto-reset
 
 go 1.26.0
 

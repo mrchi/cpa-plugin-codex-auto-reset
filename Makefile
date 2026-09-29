@@ -4,7 +4,7 @@ EXT := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
 .PHONY: build vet test clean
 
 build:
-	CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-auto-reset.$(EXT) .
+	CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-plugin-codex-auto-reset.$(EXT) .
 
 vet:
 	go vet ./...

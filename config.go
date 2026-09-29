@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	pluginID = "cpa-auto-reset"
+	pluginID = "cpa-plugin-codex-auto-reset"
 
 	defaultManagementBaseURL = "http://127.0.0.1:8317"
 )
@@ -20,7 +20,7 @@ type lifecycleRequest struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
-// pluginConfig mirrors plugins.configs.cpa-auto-reset. The host injects `enabled`
+// pluginConfig mirrors plugins.configs.cpa-plugin-codex-auto-reset. The host injects `enabled`
 // and `priority`; anything else here is plugin-private.
 type pluginConfig struct {
 	Enabled            bool     `yaml:"enabled"`

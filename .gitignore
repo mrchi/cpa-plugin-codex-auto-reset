@@ -4,4 +4,4 @@ dist/
 *.so
 *.dylib
 *.h
-/cpa-auto-reset
+/cpa-plugin-codex-auto-reset

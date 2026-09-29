@@ -1,4 +1,4 @@
-# cpa-auto-reset
+# cpa-plugin-codex-auto-reset
 
 CLIProxyAPI 插件：codex 订阅渠道的周限额用尽且账号持有 reset credit 时，自动消耗一张 credit 重置限额并恢复该凭证可用。
 

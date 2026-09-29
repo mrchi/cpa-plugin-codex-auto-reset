@@ -1,23 +1,23 @@
 # 实现决策（01/02/03 共用的技术契约）
 
-来源：两份探索报告（含 `文件:行号` 证据）。
-- CPA 插件 ABI 与 host 回调：`/Users/chi/.cache/cpa-auto-reset/research/01-cpa-plugin-abi.md`
-- 上游 reset-credit 接口：`/Users/chi/.cache/cpa-auto-reset/research/02-upstream-reset-credit-api.md`
+两份探索报告（基于本地 CLIProxyAPI v8 源码与上游接口一手资料整理，含 `文件:行号` 证据，未入库）：
+- CPA 插件 ABI 与 host 回调（`01-cpa-plugin-abi.md`）
+- 上游 reset-credit 接口（`02-upstream-reset-credit-api.md`）
 
 实现前先读这两份报告；本文件只记决策，不重复证据。**报告与 spec 冲突处以报告为准**（已在下文标注）。
 
 ## 仓库与构建
 
-- D1 module 路径 `github.com/mrchi/cpa-auto-reset`，单模块、单包 `main`，源码放仓库根目录，按关注点分文件（`main.go` ABI shim、`host.go` 接缝、`config.go`、`classify.go`、`reset.go`、`state.go`）。测试为同包 `*_test.go`。
+- D1 module 路径 `github.com/mrchi/cpa-plugin-codex-auto-reset`，单模块、单包 `main`，源码放仓库根目录，按关注点分文件（`main.go` ABI shim、`host.go` 接缝、`config.go`、`classify.go`、`reset.go`、`state.go`）。测试为同包 `*_test.go`。
 - D2 依赖：`github.com/router-for-me/CLIProxyAPI/v8`（只用 `sdk/pluginabi` + `sdk/pluginapi`，v8.0.3）、`gopkg.in/yaml.v3`。**不写 replace**；SDK 已发布到 proxy。已实测：import 这两个包可正常 `-buildmode=c-shared` 构建。UUID v4 由 `crypto/rand` 手写（版本位 `raw[6]=(raw[6]&0x0f)|0x40`、变体位 `raw[8]=(raw[8]&0x3f)|0x80`），**不引入 `github.com/google/uuid`**——只用到唯一性，标准库够。
 - D3 RPC 契约一律用 SDK 的 struct（`pluginapi.UsageRecord`、`Metadata`、`Capabilities` 无 JSON tag ⇒ PascalCase key；`pluginapi.HTTPResponse`、`HostAuthFileEntry` 有 tag ⇒ snake_case）。**不要手抄这些 struct**——字段名写错是静默失效。
 - D4 cgo ABI shim 需手写，照 `~/Playground/CLIProxyAPI/examples/plugin/usage/go/main.go` 的 C typedef 与 envelope：导出 `cliproxy_plugin_init` / `cliproxyPluginCall` / `cliproxyPluginFree` / `cliproxyPluginShutdown`；`abi_version` 必须精确等于 1（`pluginabi.ABIVersion`）；响应 envelope `{"ok":true,"result":{...}}` / `{"ok":false,"error":{...}}`。
-- D5 构建：`CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-auto-reset.dylib .`（darwin 后缀必须 `.dylib`；linux `.so`）。产物旁会多出 `.h`，加进 `.gitignore`。
+- D5 构建：`CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o dist/cpa-plugin-codex-auto-reset.dylib .`（darwin 后缀必须 `.dylib`；linux `.so`）。产物旁会多出 `.h`，加进 `.gitignore`。
 - D6 方法分发只处理 `plugin.register`、`plugin.reconfigure`（与 register 同 schema）、`plugin.shutdown`、`usage.handle`，其余返回 `unknown_method`。
 
 ## 注册与配置
 
-- D7 `capabilities` 只置 `usage_plugin: true`；`metadata` 的 `Name` / `Version` / `Author` / `GitHubRepository` 四项**都必填非空**，否则注册被拒（`Name=cpa-auto-reset`、`Version=0.1.0`、`GitHubRepository=https://github.com/mrchi/cpa-auto-reset`）。响应 `schema_version` 填 1（0 或缺失按 1 处理，不可大于 6）。
+- D7 `capabilities` 只置 `usage_plugin: true`；`metadata` 的 `Name` / `Version` / `Author` / `GitHubRepository` 四项**都必填非空**，否则注册被拒（`Name=cpa-plugin-codex-auto-reset`、`Version=0.1.0`、`GitHubRepository=https://github.com/mrchi/cpa-plugin-codex-auto-reset`）。响应 `schema_version` 填 1（0 或缺失按 1 处理，不可大于 6）。
 - D8 配置来源只有 register/reconfigure 请求的 `config_yaml`（base64 → `[]byte` → `yaml.Unmarshal`）。键：
   - `enabled` bool，host 会强制补齐该键（值取自 `plugins.configs.<id>.enabled`）；插件侧缺省视为 `true`
   - `exclude_credentials` []string（auth id / auth 文件名 / auth_index，任一匹配即排除）。匹配只用 `usage.handle` 记录自带的 `AuthID`、`path.Base(AuthID)` 与 `AuthIndex`，**不调 `host.auth.list`**：记录里的字段足够，多一次 host 往返只增加失败面。
@@ -34,7 +34,7 @@
   - 收到命中信号时若 `inFlight` 或 `now < suppressedUntil` → 记 debug 日志后直接丢弃（不做阻塞等待，避免 goroutine 堆积）。两种丢弃各记各的日志文案，日志里能区分"流程进行中"与"刚重置过"。
   - 否则置 `inFlight`，起 goroutine；流程结束清 `inFlight`，成功时置 `suppressedUntil = now + 5m`
 - D25 时间来源只有一个：`state.go` 的进程时钟（`now()` 读、`setClock()` 换）。debounce 抑制窗口、credit 过期判断与 `resets_at` 推算全部读它；测试用 `useFakeClock` 换成假时钟推进时间，不依赖真实时钟、也不真的等 5 分钟。时钟会被重置流程的 goroutine 读取（D11），所以换表加锁。
-- D13 host 调用统一经一个接缝接口（ticket 01 建立），生产实现走 C 回调，测试用 fake。`host.log` 的 level 只认 `trace`/`info`/`warn`/`error`，其它值（含 `debug`）落到 debug 级别；`fields` 固定带 `{"plugin":"cpa-auto-reset"}`（host 不自动补插件标识）。
+- D13 host 调用统一经一个接缝接口（ticket 01 建立），生产实现走 C 回调，测试用 fake。`host.log` 的 level 只认 `trace`/`info`/`warn`/`error`，其它值（含 `debug`）落到 debug 级别；`fields` 固定带 `{"plugin":"cpa-plugin-codex-auto-reset"}`（host 不自动补插件标识）。
 
 ## 上游调用（ticket 03）
 
