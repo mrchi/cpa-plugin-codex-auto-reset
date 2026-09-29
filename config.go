@@ -14,7 +14,8 @@ const (
 )
 
 // lifecycleRequest is the register/reconfigure payload; ConfigYAML arrives base64
-// encoded because it is a []byte (D8).
+// encoded because it is a []byte (D8). schema_version is decoded only to keep the wire
+// shape visible: this plugin advertises version 1 and reads no behaviour from it.
 type lifecycleRequest struct {
 	ConfigYAML    []byte `json:"config_yaml"`
 	SchemaVersion uint32 `json:"schema_version"`

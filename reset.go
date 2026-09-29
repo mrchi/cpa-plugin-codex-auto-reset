@@ -32,8 +32,6 @@ const (
 	// Account id placeholders that must never be sent as a header (D14).
 	placeholderAccountPrefixEmail = "email_"
 	placeholderAccountPrefixLocal = "local_"
-
-	accountIDClaimKey = "https://api.openai.com/auth"
 )
 
 // Reset-flow log messages, one per outcome, so credit consumption stays auditable
@@ -156,7 +154,7 @@ func fetchResetCredit(h host, creds authCredentials, record pluginapi.UsageRecor
 		h.log("warn", reasonCreditsListFailed, logFields(resetFields(record, map[string]any{"error": errDo.Error()})))
 		return resetCredit{}, false
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
+	if !isSuccessStatus(response.StatusCode) {
 		h.log("warn", reasonCreditsListFailed, logFields(resetFields(record, map[string]any{"status_code": response.StatusCode})))
 		return resetCredit{}, false
 	}
@@ -177,15 +175,19 @@ func fetchResetCredit(h host, creds authCredentials, record pluginapi.UsageRecor
 
 // consumeResetCredit redeems one credit by id. Only reset and already_redeemed mean
 // the credit is gone; nothing_to_reset, no_credit (both HTTP 200), any other code and
-// every non-2xx status are failures that consumed nothing (D17). Each branch adds its
-// own detail to the local field set and returns, so the set is never shared.
+// every non-2xx status are failures that consumed nothing (D17).
 func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string, record pluginapi.UsageRecord) (string, bool) {
 	fields := map[string]any{"credit_id": creditID, "redeem_request_id": redeemID}
-	body, errMarshal := json.Marshal(consumeRequest{RedeemRequestID: redeemID, CreditID: creditID})
-	if errMarshal != nil {
-		fields["error"] = errMarshal.Error()
+	// fail adds the one detail that explains this attempt and writes the single line
+	// the flow logs for it, so no branch can fail silently (spec story 17).
+	fail := func(key string, detail any) (string, bool) {
+		fields[key] = detail
 		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
 		return "", false
+	}
+	body, errMarshal := json.Marshal(consumeRequest{RedeemRequestID: redeemID, CreditID: creditID})
+	if errMarshal != nil {
+		return fail("error", errMarshal.Error())
 	}
 	response, errDo := h.httpDo(httpRequest{
 		Method:  http.MethodPost,
@@ -194,29 +196,27 @@ func consumeResetCredit(h host, creds authCredentials, creditID, redeemID string
 		Body:    body,
 	})
 	if errDo != nil {
-		fields["error"] = errDo.Error()
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
-		return "", false
+		return fail("error", errDo.Error())
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		fields["status_code"] = response.StatusCode
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
-		return "", false
+	if !isSuccessStatus(response.StatusCode) {
+		return fail("status_code", response.StatusCode)
 	}
 	var result consumeResponse
 	if errUnmarshal := json.Unmarshal(response.Body, &result); errUnmarshal != nil {
-		fields["error"] = errUnmarshal.Error()
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
-		return "", false
+		return fail("error", errUnmarshal.Error())
 	}
 	switch result.Code {
 	case consumeCodeReset, consumeCodeAlreadyRedeemed:
 		return result.Code, true
 	default:
-		fields["code"] = result.Code
-		h.log("warn", reasonConsumeFailed, logFields(resetFields(record, fields)))
-		return "", false
+		return fail("code", result.Code)
 	}
+}
+
+// isSuccessStatus reports whether an upstream call answered 2xx. CPA's management API is
+// stricter than the upstream one: clearCooldown accepts exactly 200 (D19).
+func isSuccessStatus(status int) bool {
+	return status >= 200 && status < 300
 }
 
 // clearCooldown asks CPA's management API to drop the credential's cooldown, so the
@@ -249,43 +249,49 @@ func clearCooldown(h host, cfg pluginConfig, record pluginapi.UsageRecord) {
 	h.log("info", reasonCooldownCleared, logFields(resetFields(record, nil)))
 }
 
+// creditExpiry is a credit's expires_at as parsed: Dated is false for a null or
+// unparsable value, which means "never expires" (D16).
+type creditExpiry struct {
+	at    time.Time
+	dated bool
+}
+
+// before reports whether this credit should be spent before the other: a dated credit
+// always beats an undated one, and between two dated credits the earlier expiry wins.
+// Two undated credits are equivalent, so the first one stands.
+func (e creditExpiry) before(other creditExpiry) bool {
+	if e.dated != other.dated {
+		return e.dated
+	}
+	if !e.dated {
+		return false
+	}
+	return e.at.Before(other.at)
+}
+
 // pickCredit returns the available credit closest to expiry. A credit that has already
 // expired is skipped: consuming it would only earn a no_credit, which would abandon
-// the flow while a usable credit sits next to it. A null (or unparsable) expires_at
-// means "never expires" and always ranks last (D16). Credits are spent before their
-// 30-day expiry rather than hoarded (spec story 7).
+// the flow while a usable credit sits next to it. Credits are spent before their 30-day
+// expiry rather than hoarded (spec story 7).
 func pickCredit(credits []resetCredit) (resetCredit, bool) {
 	at := now()
 	var chosen resetCredit
-	var chosenExpiry time.Time
-	chosenDated, found := false, false
+	var chosenExpiry creditExpiry
+	found := false
 	for _, credit := range credits {
 		if credit.Status != creditStatusAvailable || strings.TrimSpace(credit.ID) == "" {
 			continue
 		}
-		expiry, errParse := time.Parse(time.RFC3339, credit.ExpiresAt)
-		dated := errParse == nil
-		if dated && !expiry.After(at) {
+		parsed, errParse := time.Parse(time.RFC3339, credit.ExpiresAt)
+		candidate := creditExpiry{at: parsed, dated: errParse == nil}
+		if candidate.dated && !candidate.at.After(at) {
 			continue
 		}
-		if !found || earlier(expiry, dated, chosenExpiry, chosenDated) {
-			chosen, chosenExpiry, chosenDated, found = credit, expiry, dated, true
+		if !found || candidate.before(chosenExpiry) {
+			chosen, chosenExpiry, found = credit, candidate, true
 		}
 	}
 	return chosen, found
-}
-
-// earlier reports whether a candidate credit should replace the current choice: a
-// dated credit always beats an undated one, and between two dated credits the
-// earlier expiry wins. Two undated credits are equivalent, so the first one stands.
-func earlier(candidate time.Time, candidateDated bool, chosen time.Time, chosenDated bool) bool {
-	if candidateDated != chosenDated {
-		return candidateDated
-	}
-	if !candidateDated {
-		return false
-	}
-	return candidate.Before(chosen)
 }
 
 // authCredentials is what upstream calls need from the stored auth file (D14).

@@ -103,11 +103,13 @@ func waitForSuppressed(t *testing.T, fake *fakeHost, record pluginapi.UsageRecor
 	})
 }
 
-// jwtWithAccountID builds an unsigned id_token carrying the account id claim.
+// jwtWithAccountID builds an unsigned id_token carrying the account id claim. The claim
+// key is spelled here rather than shared with production: the fixture must fail if the
+// namespace production reads ever drifts away from this one.
 func jwtWithAccountID(t *testing.T, accountID string) string {
 	t.Helper()
 	payload, errMarshal := json.Marshal(map[string]any{
-		accountIDClaimKey: map[string]string{"chatgpt_account_id": accountID},
+		"https://api.openai.com/auth": map[string]string{"chatgpt_account_id": accountID},
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal id_token claims: %v", errMarshal)
@@ -544,11 +546,11 @@ func TestMissingManagementKeyConsumesNothing(t *testing.T) {
 // burn a second credit.
 func TestIdempotencyKeyIsGeneratedPerFlow(t *testing.T) {
 	useFakeClock(t, testClock)
-	registerConfig(t, scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset), managementConfigYAML)
 
 	keys := make([]string, 0, 2)
 	for _, index := range []string{authIndex, "b2e1c8"} {
 		fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+		registerConfig(t, fake, managementConfigYAML)
 		fake.withCredential(index, `{"access_token":"`+accessToken+`","account_id":"`+accountID+`"}`)
 		record := hitRecord()
 		record.AuthIndex = index
