@@ -12,6 +12,7 @@ import (
 // Window constants carried by the codex 429 error body (ADR-0002).
 const (
 	weeklyWindowMinutes   = 10080
+	fiveHourWindowMinutes = 300
 	weeklyFallbackSeconds = 18000 // longer than the 5-hour window, so it must be weekly
 	oneDaySeconds         = 86400
 )
@@ -69,10 +70,15 @@ func classify(record pluginapi.UsageRecord, cfg pluginConfig) classification {
 	}
 	result.WindowMinutes, result.HasWindowMinutes = limit.windowMinutes, limit.hasWindowMinutes
 	result.Weekly = limit.isWeekly(resetsIn)
+	// The window label is what the decision log reports. An explicit window that is
+	// neither one this plugin acts on is left unlabelled rather than being called
+	// 5-hour; without an explicit window only the fallback can name it.
 	switch {
 	case result.Weekly:
 		result.Window = windowWeekly
-	case limit.hasWindowMinutes || okResets:
+	case limit.hasWindowMinutes && limit.windowMinutes == fiveHourWindowMinutes:
+		result.Window = windowFiveHour
+	case !limit.hasWindowMinutes && okResets:
 		result.Window = windowFiveHour
 	default:
 		result.Window = windowUnknown
@@ -101,22 +107,25 @@ func classify(record pluginapi.UsageRecord, cfg pluginConfig) classification {
 	return result
 }
 
-// usageLimit is the part of the upstream 429 body this plugin cares about.
+// usageLimit is the part of the upstream 429 body this plugin cares about. Each field
+// carries its own presence flag, so a value that is absent can never be mistaken for a
+// value that is merely zero.
 type usageLimit struct {
-	resetsInSeconds  int64
-	resetsAt         time.Time
-	hasResetsAt      bool
-	windowMinutes    int64
-	hasWindowMinutes bool
+	resetsInSeconds    int64
+	hasResetsInSeconds bool
+	resetsAt           time.Time
+	hasResetsAt        bool
+	windowMinutes      int64
+	hasWindowMinutes   bool
 }
 
 // resetsIn reports how long the window still has to run: the explicit
-// resets_in_seconds when it is positive, otherwise a resets_at timestamp measured
+// resets_in_seconds when it is present, otherwise a resets_at timestamp measured
 // against at. The body carries both fields, and a body carrying only resets_at must
 // still classify — otherwise the whole feature fails silently on that shape. ok=false
 // means the body gave no usable timing at all.
 func (l usageLimit) resetsIn(at time.Time) (int64, bool) {
-	if l.resetsInSeconds > 0 {
+	if l.hasResetsInSeconds {
 		return l.resetsInSeconds, true
 	}
 	if !l.hasResetsAt {
@@ -182,9 +191,9 @@ func parseUsageLimit(body string) (usageLimit, bool) {
 				limit.windowMinutes, limit.hasWindowMinutes = value, true
 			}
 		}
-		if limit.resetsInSeconds == 0 {
-			if value, okValue := bodyInt64(candidate["resets_in_seconds"]); okValue {
-				limit.resetsInSeconds = value
+		if !limit.hasResetsInSeconds {
+			if value, okValue := bodyInt64(candidate["resets_in_seconds"]); okValue && value > 0 {
+				limit.resetsInSeconds, limit.hasResetsInSeconds = value, true
 			}
 		}
 		if !limit.hasResetsAt {

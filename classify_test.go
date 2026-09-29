@@ -197,6 +197,16 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			wantWindow: windowFiveHour,
 		},
 		{
+			// A window the plugin does not act on must not be reported as the 5-hour one:
+			// the label is what the audit log says was seen.
+			name:       "an explicit window that is neither weekly nor 5-hour is unknown",
+			configYAML: "enabled: true\n",
+			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":43200,"resets_in_seconds":3600`)),
+			wantLevel:  "debug",
+			wantReason: reasonNotWeekly,
+			wantWindow: windowUnknown,
+		},
+		{
 			name:       "weekly window without reset timing is not a hit",
 			configYAML: "enabled: true\n",
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080`)),
@@ -219,6 +229,18 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
 			wantWindow: windowWeekly,
+		},
+		{
+			// The nested object is read first, so a non-positive timing inside it must not
+			// claim the field and hide the usable one at the top level.
+			name:       "a negative nested resets_in_seconds does not mask the top-level timing",
+			configYAML: "enabled: true\n",
+			record: usageRecord(`{"error":{"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":-1},` +
+				`"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000}`),
+			wantLevel:        "info",
+			wantReason:       reasonHit,
+			wantWindow:       windowWeekly,
+			wantResetsInSecs: 200000,
 		},
 		{
 			name:       "an unparsable resets_at is not a hit",
