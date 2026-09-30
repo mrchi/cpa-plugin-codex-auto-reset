@@ -65,7 +65,7 @@ import (
 )
 
 const (
-	pluginVersion = "0.1.1"
+	pluginVersion = "0.2.0"
 	pluginAuthor  = "mrchi"
 	pluginRepo    = "https://github.com/mrchi/cpa-plugin-codex-auto-reset"
 
