@@ -36,8 +36,8 @@ func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 			if _, errHandle := handleMethod(fake, pluginabi.MethodPluginRegister, payload); errHandle != nil {
 				t.Fatalf("plugin.register: %v", errHandle)
 			}
-			if logs := fake.logged(); len(logs) != 0 {
-				t.Fatalf("logs = %+v, want no logs", logs)
+			if logs := fake.logged(); len(logs) != 1 || logs[0].Level != "warn" || logs[0].Message != warnNoIncludedCredentials {
+				t.Fatalf("logs = %+v, want exactly the empty-include warning", logs)
 			}
 			sendUsage(t, fake, hitRecord())
 			matched := logsWithMessage(fake.logged(), reasonNotIncluded)
@@ -49,6 +49,44 @@ func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 			}
 			if got := fake.requestCount(); got != 0 {
 				t.Errorf("http.do calls = %v, want none without an included credential", fake.callTrace())
+			}
+		})
+	}
+}
+
+// TestEmptyIncludeListWarns covers ticket 02: an enabled plugin that names no
+// credential acts on nothing, so every load says so exactly once. Disabled configs and
+// non-empty lists stay quiet.
+func TestEmptyIncludeListWarns(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		configYAML string
+		wantWarn   bool
+	}{
+		{name: "enabled with no list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: true\n", wantWarn: true},
+		{name: "enabled with only blank entries", method: pluginabi.MethodPluginRegister, configYAML: "enabled: true\ninclude_credentials:\n  - \"  \"\n", wantWarn: true},
+		{name: "reconfigure with no list", method: pluginabi.MethodPluginReconfigure, configYAML: "enabled: true\n", wantWarn: true},
+		{name: "disabled with no list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: false\n"},
+		{name: "disabled with a list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: false\ninclude_credentials:\n  - " + authFile + "\n"},
+		{name: "enabled with a list", method: pluginabi.MethodPluginRegister, configYAML: includedConfigYAML},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeHost()
+			if _, errHandle := handleMethod(fake, test.method, lifecyclePayload(t, test.configYAML)); errHandle != nil {
+				t.Fatalf("%s: %v", test.method, errHandle)
+			}
+			matched := logsWithMessage(fake.logged(), warnNoIncludedCredentials)
+			if !test.wantWarn {
+				if len(matched) != 0 {
+					t.Fatalf("empty-include warnings = %+v, want none", matched)
+				}
+				return
+			}
+			if len(matched) != 1 || matched[0].Level != "warn" {
+				t.Fatalf("empty-include warnings = %+v, want exactly one warn", matched)
 			}
 		})
 	}
@@ -201,9 +239,14 @@ func TestInvalidConfigWarnsAndKeepsTheDefaults(t *testing.T) {
 				t.Fatalf("plugin.register: %v", errHandle)
 			}
 			decodeResult(t, raw)
+			// The bad input warns, then the defaults it falls back to warn again: the
+			// plugin is enabled with an empty include list.
 			logs := fake.logged()
-			if len(logs) != 1 || logs[0].Level != "warn" {
-				t.Fatalf("logs = %+v, want exactly one warning", logs)
+			if len(logs) != 2 || logs[0].Level != "warn" || logs[1].Level != "warn" {
+				t.Fatalf("logs = %+v, want exactly two warnings", logs)
+			}
+			if got := logsWithMessage(logs, warnNoIncludedCredentials); len(got) != 1 {
+				t.Fatalf("empty-include warnings = %+v, want one", got)
 			}
 
 			// The defaults are in effect: the plugin is enabled with an empty include
