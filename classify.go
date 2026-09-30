@@ -244,16 +244,22 @@ func parseResetsAt(raw json.RawMessage) (time.Time, bool) {
 	return parsed, true
 }
 
+// isBlankEntry reports whether an include_credentials entry names no credential:
+// blank entries never match and never count as naming one (D8).
+func isBlankEntry(entry string) bool {
+	return strings.TrimSpace(entry) == ""
+}
+
 // isIncluded matches include_credentials entries against the credential's auth id,
 // its auth file name and its runtime auth index (D8). A blank entry never matches, so
 // an empty include list does not accidentally include everything.
 func isIncluded(entries []string, record pluginapi.UsageRecord) bool {
 	fileName := path.Base(record.AuthID)
 	for _, entry := range entries {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
+		if isBlankEntry(entry) {
 			continue
 		}
+		entry = strings.TrimSpace(entry)
 		if entry == record.AuthID || entry == fileName || entry == record.AuthIndex {
 			return true
 		}

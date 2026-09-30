@@ -54,10 +54,10 @@ func parseConfig(h host, request []byte) pluginConfig {
 }
 
 // hasIncludedCredential reports whether the include list names any credential after
-// dropping blank entries, mirroring isIncluded's matching rules (D8).
+// dropping blank entries (D8).
 func hasIncludedCredential(entries []string) bool {
 	for _, entry := range entries {
-		if strings.TrimSpace(entry) != "" {
+		if !isBlankEntry(entry) {
 			return true
 		}
 	}
