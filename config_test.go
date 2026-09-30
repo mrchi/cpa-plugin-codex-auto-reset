@@ -18,10 +18,10 @@ func lifecyclePayload(t *testing.T, configYAML string) []byte {
 }
 
 // TestRegisterWithoutConfigKeepsTheDefaults registers with every shape of "no plugin
-// configuration" and shows the defaults are in effect: the plugin stays enabled, and a
-// weekly exhaustion is still classified as a hit. The default configuration carries no
-// management key, so the flow stops at the pre-flight and spends nothing — the
-// operator has to configure the key before auto-reset can do anything.
+// configuration" and shows the defaults are in effect: the plugin stays enabled, but
+// the default include list is empty, so a weekly exhaustion is not included and the
+// plugin spends nothing. The operator has to name the credentials before auto-reset can
+// act on them (ADR-0004).
 func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 	cases := map[string][]byte{
 		"no payload":   nil,
@@ -36,20 +36,57 @@ func TestRegisterWithoutConfigKeepsTheDefaults(t *testing.T) {
 			if _, errHandle := handleMethod(fake, pluginabi.MethodPluginRegister, payload); errHandle != nil {
 				t.Fatalf("plugin.register: %v", errHandle)
 			}
-			if logs := fake.logged(); len(logs) != 0 {
-				t.Fatalf("logs = %+v, want no warnings", logs)
+			if logs := fake.logged(); len(logs) != 1 || logs[0].Level != "warn" || logs[0].Message != warnNoIncludedCredentials {
+				t.Fatalf("logs = %+v, want exactly the empty-include warning", logs)
 			}
 			sendUsage(t, fake, hitRecord())
-			matched := logsWithMessage(fake.logged(), reasonHit)
-			if len(matched) != 1 || matched[0].Level != "info" {
-				t.Fatalf("hit logs = %+v, want one info line: the default is enabled", matched)
+			matched := logsWithMessage(fake.logged(), reasonNotIncluded)
+			if len(matched) != 1 || matched[0].Level != "debug" {
+				t.Fatalf("not-included logs = %+v, want one debug line: the default includes nothing", matched)
 			}
-			// The hit dispatches the reset flow, which stops at the pre-flight because
-			// the default configuration carries no management key: waiting for its line
-			// keeps this case deterministic and pins that no credit can be spent.
-			waitForLog(t, fake, reasonManagementKeyEmpty)
+			if got := fake.authGetCalls(); len(got) != 0 {
+				t.Errorf("auth.get calls = %v, want none", got)
+			}
 			if got := fake.requestCount(); got != 0 {
-				t.Errorf("http.do calls = %v, want none without a management key", fake.callTrace())
+				t.Errorf("http.do calls = %v, want none without an included credential", fake.callTrace())
+			}
+		})
+	}
+}
+
+// TestEmptyIncludeListWarns covers ticket 02: an enabled plugin that names no
+// credential acts on nothing, so every load says so exactly once. Disabled configs and
+// non-empty lists stay quiet.
+func TestEmptyIncludeListWarns(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		configYAML string
+		wantWarn   bool
+	}{
+		{name: "enabled with no list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: true\n", wantWarn: true},
+		{name: "enabled with only blank entries", method: pluginabi.MethodPluginRegister, configYAML: "enabled: true\ninclude_credentials:\n  - \"  \"\n", wantWarn: true},
+		{name: "reconfigure with no list", method: pluginabi.MethodPluginReconfigure, configYAML: "enabled: true\n", wantWarn: true},
+		{name: "disabled with no list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: false\n"},
+		{name: "disabled with a list", method: pluginabi.MethodPluginRegister, configYAML: "enabled: false\ninclude_credentials:\n  - " + authFile + "\n"},
+		{name: "enabled with a list", method: pluginabi.MethodPluginRegister, configYAML: includedConfigYAML},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeHost()
+			if _, errHandle := handleMethod(fake, test.method, lifecyclePayload(t, test.configYAML)); errHandle != nil {
+				t.Fatalf("%s: %v", test.method, errHandle)
+			}
+			matched := logsWithMessage(fake.logged(), warnNoIncludedCredentials)
+			if !test.wantWarn {
+				if len(matched) != 0 {
+					t.Fatalf("empty-include warnings = %+v, want none", matched)
+				}
+				return
+			}
+			if len(matched) != 1 || matched[0].Level != "warn" {
+				t.Fatalf("empty-include warnings = %+v, want exactly one warn", matched)
 			}
 		})
 	}
@@ -72,9 +109,9 @@ func TestRegisterDisabledIgnoresExhaustion(t *testing.T) {
 	}
 }
 
-// TestExcludeCredentialsSkipsMatchingCredential covers the per-credential exclusion
+// TestIncludeCredentialsGatesMatchingCredential covers the per-credential include
 // list, matched against the auth id, its file name and the runtime auth index.
-func TestExcludeCredentialsSkipsMatchingCredential(t *testing.T) {
+func TestIncludeCredentialsGatesMatchingCredential(t *testing.T) {
 	tests := []struct {
 		name       string
 		configYAML string
@@ -82,34 +119,34 @@ func TestExcludeCredentialsSkipsMatchingCredential(t *testing.T) {
 		wantReason string
 	}{
 		{
-			name:       "excluded by auth id",
-			configYAML: "enabled: true\nexclude_credentials:\n  - codex-a@example.com.json\n",
-			authID:     "codex-a@example.com.json",
-			wantReason: reasonExcluded,
-		},
-		{
-			name:       "excluded by auth file name",
-			configYAML: "enabled: true\nexclude_credentials:\n  - codex-a@example.com.json\n",
-			authID:     "codex/codex-a@example.com.json",
-			wantReason: reasonExcluded,
-		},
-		{
-			name:       "excluded by auth index",
-			configYAML: "enabled: true\nexclude_credentials:\n  - c1f0a9\n",
-			authID:     "codex-a@example.com.json",
-			wantReason: reasonExcluded,
-		},
-		{
-			name:       "a blank entry never excludes",
-			configYAML: "enabled: true\nmanagement_key: secret-key\nexclude_credentials:\n  - \"  \"\n",
+			name:       "included by auth id",
+			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - codex-a@example.com.json\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
 		{
-			name:       "an absent list never excludes",
+			name:       "included by auth file name",
+			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - codex-a@example.com.json\n",
+			authID:     "codex/codex-a@example.com.json",
+			wantReason: reasonHit,
+		},
+		{
+			name:       "included by auth index",
+			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - c1f0a9\n",
+			authID:     "codex-a@example.com.json",
+			wantReason: reasonHit,
+		},
+		{
+			name:       "a blank entry includes nothing",
+			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - \"  \"\n",
+			authID:     "codex-a@example.com.json",
+			wantReason: reasonNotIncluded,
+		},
+		{
+			name:       "an absent list includes nothing",
 			configYAML: "enabled: true\nmanagement_key: secret-key\n",
 			authID:     "codex-a@example.com.json",
-			wantReason: reasonHit,
+			wantReason: reasonNotIncluded,
 		},
 	}
 
@@ -126,9 +163,12 @@ func TestExcludeCredentialsSkipsMatchingCredential(t *testing.T) {
 			if got := logsWithMessage(fake.logged(), test.wantReason); len(got) != 1 {
 				t.Fatalf("logs with %q = %+v (all logs %+v), want one", test.wantReason, got, fake.logged())
 			}
-			if test.wantReason == reasonExcluded {
+			if test.wantReason == reasonNotIncluded {
 				if got := fake.authGetCalls(); len(got) != 0 {
 					t.Errorf("auth.get calls = %v, want none", got)
+				}
+				if got := fake.requestCount(); got != 0 {
+					t.Errorf("http.do calls = %v, want none", got)
 				}
 				return
 			}
@@ -144,7 +184,7 @@ func TestConfiguredManagementEndpointIsUsed(t *testing.T) {
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 	configuredURL := "http://127.0.0.1:9000"
 	fake.script(http.MethodPost, configuredURL+managementResetQuotaPath, http.StatusOK, `{"status":"ok"}`)
-	registerConfig(t, fake, "enabled: true\nmanagement_key: secret-key\nmanagement_base_url: "+configuredURL+"/\n")
+	registerConfig(t, fake, managementConfigYAML+"management_base_url: "+configuredURL+"/\n")
 
 	sendUsage(t, fake, hitRecord())
 	waitForLog(t, fake, reasonCooldownCleared)
@@ -160,7 +200,7 @@ func TestConfiguredManagementEndpointIsUsed(t *testing.T) {
 func TestBlankManagementBaseURLFallsBackToDefault(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-	registerConfig(t, fake, "enabled: true\nmanagement_key: secret-key\nmanagement_base_url: \"  \"\n")
+	registerConfig(t, fake, managementConfigYAML+"management_base_url: \"  \"\n")
 
 	sendUsage(t, fake, hitRecord())
 	waitForLog(t, fake, reasonCooldownCleared)
@@ -199,22 +239,28 @@ func TestInvalidConfigWarnsAndKeepsTheDefaults(t *testing.T) {
 				t.Fatalf("plugin.register: %v", errHandle)
 			}
 			decodeResult(t, raw)
+			// The bad input warns, then the defaults it falls back to warn again: the
+			// plugin is enabled with an empty include list.
 			logs := fake.logged()
-			if len(logs) != 1 || logs[0].Level != "warn" {
-				t.Fatalf("logs = %+v, want exactly one warning", logs)
+			if len(logs) != 2 || logs[0].Level != "warn" || logs[1].Level != "warn" {
+				t.Fatalf("logs = %+v, want exactly two warnings", logs)
+			}
+			if got := logsWithMessage(logs, warnNoIncludedCredentials); len(got) != 1 {
+				t.Fatalf("empty-include warnings = %+v, want one", got)
 			}
 
-			// The defaults are in effect: the plugin is enabled, so the record is a hit
-			// and the reset flow starts — then stops at the missing management key
-			// without touching upstream.
+			// The defaults are in effect: the plugin is enabled with an empty include
+			// list, so the record is not included and nothing is spent.
 			fake.clearLogs()
 			sendUsage(t, fake, hitRecord())
-			if got := logsWithMessage(fake.logged(), reasonHit); len(got) != 1 {
-				t.Fatalf("hit logs = %+v, want the default enabled plugin to hit", got)
+			if got := logsWithMessage(fake.logged(), reasonNotIncluded); len(got) != 1 {
+				t.Fatalf("not-included logs = %+v, want the default plugin to include nothing", got)
 			}
-			waitForLog(t, fake, reasonManagementKeyEmpty)
+			if got := fake.authGetCalls(); len(got) != 0 {
+				t.Errorf("auth.get calls = %v, want none", got)
+			}
 			if got := fake.requestCount(); got != 0 {
-				t.Errorf("http.do calls = %v, want none without a management key", fake.callTrace())
+				t.Errorf("http.do calls = %v, want none", fake.callTrace())
 			}
 		})
 	}

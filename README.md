@@ -11,7 +11,7 @@
 - 上游 429 且错误体 `type == "usage_limit_reached"`
 - 窗口为周窗：`limit_window_minutes == 10080`，字段缺失时以 `resets_in_seconds > 18000`（或由 `resets_at` 推算）兜底
 - 自然恢复在一天之外：`resets_in_seconds > 86400`
-- 插件 `enabled` 为真，且凭证不在 `exclude_credentials` 中
+- 插件 `enabled` 为真，且凭证在 `include_credentials` 中
 
 命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `expires_at` 最早且未过期的可用 credit → 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却。
 
@@ -67,10 +67,16 @@ plugins:
       enabled: true                          # 总开关；缺失视为 true
       management_key: "<CPA management key>"  # 必需：缺失时插件不消耗任何 credit（见下）
       management_base_url: "http://127.0.0.1:8317"  # 默认值
-      exclude_credentials:                    # 手工管理的账号，插件不碰
+      include_credentials:                    # 白名单：只有列出的凭证会被插件消耗 credit
         - "codex-user@example.com.json"       # auth 文件名
         - "<auth_index>"                      # 或运行时 auth index
 ```
+
+### 升级必读（破坏性变更）
+
+作用范围从旧的排除名单改为纳入名单 `include_credentials`，且默认**为空**。旧配置里的排除键已不再被识别，插件也不会对其做任何兼容。
+
+默认不对任何凭证动作：升级后必须显式在 `include_credentials` 中列出要纳入的凭证，否则插件启用却不会消耗任何 credit。为提示这一状态，插件在 `enabled` 为真但 `include_credentials` 为空时会在加载/改配置阶段记一条 warn。
 
 `management_key` 取自 CPA 的 `management.secret-key`；插件经本机 management API `POST /v0/management/reset-quota` 清冷却（本机访问不受 `management.allow-remote` 限制，但该 API 仍需 key 非空）。
 

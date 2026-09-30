@@ -29,7 +29,7 @@ const (
 const (
 	reasonHit           = "codex weekly usage limit reached: reset eligible"
 	reasonDisabled      = "auto-reset disabled: ignoring exhaustion signal"
-	reasonExcluded      = "credential excluded from auto-reset: ignoring exhaustion signal"
+	reasonNotIncluded   = "credential not included in auto-reset: ignoring exhaustion signal"
 	reasonNotWeekly     = "window is not the weekly window: no reset"
 	reasonWithinDay     = "weekly window recovers within a day: no reset"
 	reasonUnknownWindow = "window or reset timing missing from error body: no reset"
@@ -104,8 +104,8 @@ func classify(record pluginapi.UsageRecord, cfg pluginConfig) classification {
 	switch {
 	case !cfg.Enabled:
 		result.Reason = reasonDisabled
-	case isExcluded(cfg.ExcludeCredentials, record):
-		result.Reason = reasonExcluded
+	case !isIncluded(cfg.IncludeCredentials, record):
+		result.Reason = reasonNotIncluded
 	case limit.windowMinutes == 0 && !hasTiming:
 		result.Reason = reasonUnknownWindow
 	case !weekly:
@@ -244,16 +244,22 @@ func parseResetsAt(raw json.RawMessage) (time.Time, bool) {
 	return parsed, true
 }
 
-// isExcluded matches exclude_credentials entries against the credential's auth id,
+// isBlankEntry reports whether an include_credentials entry names no credential:
+// blank entries never match and never count as naming one (D8).
+func isBlankEntry(entry string) bool {
+	return strings.TrimSpace(entry) == ""
+}
+
+// isIncluded matches include_credentials entries against the credential's auth id,
 // its auth file name and its runtime auth index (D8). A blank entry never matches, so
-// an empty allow-list cannot accidentally exclude everything.
-func isExcluded(entries []string, record pluginapi.UsageRecord) bool {
+// an empty include list does not accidentally include everything.
+func isIncluded(entries []string, record pluginapi.UsageRecord) bool {
 	fileName := path.Base(record.AuthID)
 	for _, entry := range entries {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
+		if isBlankEntry(entry) {
 			continue
 		}
+		entry = strings.TrimSpace(entry)
 		if entry == record.AuthID || entry == fileName || entry == record.AuthIndex {
 			return true
 		}
