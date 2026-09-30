@@ -23,7 +23,7 @@ type lifecycleRequest struct {
 // and `priority`; anything else here is plugin-private.
 type pluginConfig struct {
 	Enabled            bool     `yaml:"enabled"`
-	ExcludeCredentials []string `yaml:"exclude_credentials"`
+	IncludeCredentials []string `yaml:"include_credentials"`
 	ManagementKey      string   `yaml:"management_key"`
 	ManagementBaseURL  string   `yaml:"management_base_url"`
 }
