@@ -29,7 +29,11 @@ const (
 	consumeURL = codexBaseURL + resetConsumePath
 	quotaURL   = defaultManagementBaseURL + managementResetQuotaPath
 
-	managementConfigYAML = "enabled: true\nmanagement_key: secret-key\n"
+	managementConfigYAML = "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - " + authFile + "\n"
+	// includedConfigYAML enables the plugin and includes the hit credential, but carries
+	// no management key: a hit reaches the pre-flight and stops there. Cases that only
+	// need the classification gate use this; reset-flow cases use managementConfigYAML.
+	includedConfigYAML = "enabled: true\ninclude_credentials:\n  - " + authFile + "\n"
 )
 
 // aUsableCredit is the credit listing most cases start from: it expires well after
@@ -660,7 +664,7 @@ func TestMissingManagementKeyConsumesNothing(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 
-	driveHit(t, fake, "enabled: true\n", reasonManagementKeyEmpty, hitRecord())
+	driveHit(t, fake, includedConfigYAML, reasonManagementKeyEmpty, hitRecord())
 
 	if got := fake.requestCount(); got != 0 {
 		t.Fatalf("http.do calls = %v, want none: the credit must not be spent", fake.callTrace())

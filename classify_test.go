@@ -70,7 +70,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 	}{
 		{
 			name:             "weekly window exhaustion is a hit",
-			configYAML:       "enabled: true\n",
+			configYAML:       includedConfigYAML,
 			record:           usageRecord(weeklyBody),
 			wantLevel:        "info",
 			wantReason:       reasonHit,
@@ -79,7 +79,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "top-level error object is a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(false, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000`)),
 			wantLevel:  "info",
 			wantReason: reasonHit,
@@ -87,7 +87,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:             "missing limit_window_minutes falls back to resets_in_seconds",
-			configYAML:       "enabled: true\n",
+			configYAML:       includedConfigYAML,
 			record:           usageRecord(weeklyFallbackBody),
 			wantLevel:        "info",
 			wantReason:       reasonHit,
@@ -96,7 +96,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:             "resets_at alone still classifies as a hit",
-			configYAML:       "enabled: true\n",
+			configYAML:       includedConfigYAML,
 			record:           usageRecord(resetsAtBody(testClock.Add(200000 * time.Second))),
 			bodyAt:           resetsAt(200000 * time.Second),
 			wantLevel:        "info",
@@ -106,7 +106,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "resets_at alone drives the weekly fallback window",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(timingOnlyBody(`"resets_in_seconds":200000`)),
 			bodyAt: func(at time.Time) string {
 				return timingOnlyBody(`"resets_at":"` + at.Add(200000*time.Second).Format(time.RFC3339) + `"`)
@@ -118,7 +118,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "a non-positive resets_in_seconds falls back to resets_at",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(weeklyBodyWith(`"resets_in_seconds":-1`)),
 			bodyAt: func(at time.Time) string {
 				return weeklyBodyWith(`"resets_in_seconds":-1,"resets_at":"` + at.Add(200000*time.Second).Format(time.RFC3339) + `"`)
@@ -130,7 +130,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:             "resets_in_seconds wins when both are present",
-			configYAML:       "enabled: true\n",
+			configYAML:       includedConfigYAML,
 			record:           usageRecord(weeklyBody),
 			bodyAt:           bothFields(3600 * time.Second),
 			wantLevel:        "info",
@@ -140,7 +140,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "reset exactly one day out is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":86400`)),
 			wantLevel:  "debug",
 			wantReason: reasonWithinDay,
@@ -148,7 +148,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:             "resets_at inside the one-day guard is not a hit",
-			configYAML:       "enabled: true\n",
+			configYAML:       includedConfigYAML,
 			record:           usageRecord(resetsAtBody(testClock.Add(time.Hour))),
 			bodyAt:           resetsAt(time.Hour),
 			wantLevel:        "debug",
@@ -158,7 +158,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "reset just past one day is a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":86401`)),
 			wantLevel:  "info",
 			wantReason: reasonHit,
@@ -166,7 +166,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "a resets_at already in the past is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(resetsAtBody(testClock.Add(-time.Hour))),
 			bodyAt:     resetsAt(-time.Hour),
 			wantLevel:  "debug",
@@ -175,7 +175,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "5-hour window is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":300,"resets_in_seconds":3600`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
@@ -183,7 +183,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "fallback range without limit_window_minutes is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","resets_in_seconds":3600`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
@@ -191,7 +191,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "fallback boundary 18000 is not weekly",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","resets_in_seconds":18000`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
@@ -201,7 +201,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			// A window the plugin does not act on must not be reported as the 5-hour one:
 			// the label is what the audit log says was seen.
 			name:       "an explicit window that is neither weekly nor 5-hour is unknown",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":43200,"resets_in_seconds":3600`)),
 			wantLevel:  "debug",
 			wantReason: reasonNotWeekly,
@@ -209,7 +209,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "weekly window without reset timing is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
@@ -217,7 +217,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "no window and no reset timing is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached"`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
@@ -225,7 +225,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "non-positive reset is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":-1`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
@@ -235,7 +235,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			// The nested object is read first, so a non-positive timing inside it must not
 			// claim the field and hide the usable one at the top level.
 			name:       "a negative nested resets_in_seconds does not mask the top-level timing",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record: usageRecord(`{"error":{"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":-1},` +
 				`"type":"usage_limit_reached","limit_window_minutes":10080,"resets_in_seconds":200000}`),
 			wantLevel:        "info",
@@ -245,7 +245,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "an unparsable resets_at is not a hit",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"usage_limit_reached","limit_window_minutes":10080,"resets_at":"soon"`)),
 			wantLevel:  "debug",
 			wantReason: reasonUnknownWindow,
@@ -260,44 +260,44 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			wantWindow: windowWeekly,
 		},
 		{
-			name:       "excluded by auth id",
-			configYAML: "enabled: true\nexclude_credentials:\n  - codex-a@example.com.json\n",
-			record:     usageRecord(weeklyBody),
-			wantLevel:  "debug",
-			wantReason: reasonExcluded,
-			wantWindow: windowWeekly,
-		},
-		{
-			name:       "excluded by auth file name",
-			configYAML: "enabled: true\nexclude_credentials:\n  - codex-a@example.com.json\n",
-			record: func() pluginapi.UsageRecord {
-				record := usageRecord(weeklyBody)
-				record.AuthID = "codex/codex-a@example.com.json"
-				return record
-			}(),
-			wantLevel:  "debug",
-			wantReason: reasonExcluded,
-			wantWindow: windowWeekly,
-		},
-		{
-			name:       "excluded by auth index",
-			configYAML: "enabled: true\nexclude_credentials:\n  - c1f0a9\n",
-			record:     usageRecord(weeklyBody),
-			wantLevel:  "debug",
-			wantReason: reasonExcluded,
-			wantWindow: windowWeekly,
-		},
-		{
-			name:       "blank exclude entry never matches",
-			configYAML: "enabled: true\nexclude_credentials:\n  - \"\"\n",
+			name:       "included by auth id",
+			configYAML: "enabled: true\ninclude_credentials:\n  - codex-a@example.com.json\n",
 			record:     usageRecord(weeklyBody),
 			wantLevel:  "info",
 			wantReason: reasonHit,
 			wantWindow: windowWeekly,
 		},
 		{
+			name:       "included by auth file name",
+			configYAML: "enabled: true\ninclude_credentials:\n  - codex-a@example.com.json\n",
+			record: func() pluginapi.UsageRecord {
+				record := usageRecord(weeklyBody)
+				record.AuthID = "codex/codex-a@example.com.json"
+				return record
+			}(),
+			wantLevel:  "info",
+			wantReason: reasonHit,
+			wantWindow: windowWeekly,
+		},
+		{
+			name:       "included by auth index",
+			configYAML: "enabled: true\ninclude_credentials:\n  - c1f0a9\n",
+			record:     usageRecord(weeklyBody),
+			wantLevel:  "info",
+			wantReason: reasonHit,
+			wantWindow: windowWeekly,
+		},
+		{
+			name:       "a blank include entry never matches",
+			configYAML: "enabled: true\ninclude_credentials:\n  - \"\"\n",
+			record:     usageRecord(weeklyBody),
+			wantLevel:  "debug",
+			wantReason: reasonNotIncluded,
+			wantWindow: windowWeekly,
+		},
+		{
 			name:       "non-codex provider is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record: func() pluginapi.UsageRecord {
 				record := usageRecord(weeklyBody)
 				record.Provider = "openai"
@@ -306,7 +306,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "api key credential is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record: func() pluginapi.UsageRecord {
 				record := usageRecord(weeklyBody)
 				record.AuthType = "api_key"
@@ -315,7 +315,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "successful record is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record: func() pluginapi.UsageRecord {
 				record := usageRecord(weeklyBody)
 				record.Failed = false
@@ -324,7 +324,7 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "non-429 failure is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record: func() pluginapi.UsageRecord {
 				record := usageRecord(weeklyBody)
 				record.Failure.StatusCode = 500
@@ -333,17 +333,17 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 		},
 		{
 			name:       "other error type is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(quotaBody(true, `"type":"rate_limit_error","resets_in_seconds":200000`)),
 		},
 		{
 			name:       "unparsable body is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord("upstream 429 without a json body"),
 		},
 		{
 			name:       "empty body is ignored",
-			configYAML: "enabled: true\n",
+			configYAML: includedConfigYAML,
 			record:     usageRecord(""),
 		},
 	}
@@ -447,7 +447,7 @@ func TestDecisionLogNamesItsSources(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			clock := useFakeClock(t, testClock)
 			fake := newFakeHost()
-			registerConfig(t, fake, "enabled: true\n")
+			registerConfig(t, fake, includedConfigYAML)
 			sendUsage(t, fake, usageRecord(test.body(clock.now())))
 			entry := waitForLog(t, fake, reasonHit)
 			if entry.Fields["window_source"] != test.wantWindow {
