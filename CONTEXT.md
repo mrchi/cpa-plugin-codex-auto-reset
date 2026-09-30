@@ -14,6 +14,9 @@ _Avoid_: OpenAI API 渠道（api.openai.com 按量计费，与本插件无关）
 **凭证 (Credential)**:
 CPA 中一个 codex 账号的 OAuth 凭证（auth 文件），含 access token 与 account ID，是限额的承载单位。
 
+**纳入凭证 (Included credential)**:
+插件被授权为其消耗 reset credit 的凭证子集；未纳入的凭证即使周限额用尽，插件也不动作。默认不纳入任何凭证。
+
 **用量窗口 (Usage window)**:
 OpenAI 对 codex 订阅的限额窗口，分 5 小时窗（`limit_window_minutes=300`）和周窗（`limit_window_minutes=10080`）两种，各自独立计数。
 
