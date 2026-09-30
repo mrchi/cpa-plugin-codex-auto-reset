@@ -6,7 +6,7 @@
       "name": "Codex Auto Reset",
       "description": "Consume a rate-limit reset credit when a codex subscription credential's weekly usage window is exhausted, then clear CPA's cooldown for that credential.",
       "author": "mrchi",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "repository": "https://github.com/mrchi/cpa-plugin-codex-auto-reset",
       "license": "MIT",
       "homepage": "https://github.com/mrchi/cpa-plugin-codex-auto-reset"
