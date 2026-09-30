@@ -19,13 +19,40 @@
 
 同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、consume 已发出）5 分钟内不再触发，临时故障不抑制（内存态，随 CPA 重启清空）。
 
-## 构建
+## 安装
+
+### 从 CPA 面板的插件商店安装
+
+仓库根目录的 `registry.json` 是一份 CPA 插件商店清单。把它作为自定义来源加进 CPA 配置并重启：
+
+```yaml
+plugins:
+  store-sources:
+    - "https://raw.githubusercontent.com/mrchi/cpa-plugin-codex-auto-reset/main/registry.json"
+```
+
+重启后在面板的插件商店里即可一键安装。商店从本仓库的 GitHub Release 取产物（`install.type` 缺省即 `github-release`），所以版本由 release tag 决定，装完的库落在 `<plugins.dir>/<goos>/<goarch>/`。
+
+> 商店按 CPA 运行时的 `${GOOS}_${GOARCH}` 选产物，目前发版只产出 `linux_amd64` 与 `linux_arm64`。在其它平台（如本机 macOS）用面板安装会因找不到对应产物而失败，请改用下方的手动构建。
+
+### 手动安装
 
 ```bash
 make build          # 产出 dist/cpa-plugin-codex-auto-reset.dylib（linux 为 .so）
 ```
 
 产物放到 CPA 的 `plugins/`（或 `plugins/<goos>/<goarch>/`）目录，文件名即插件 id。
+
+## 构建与发版
+
+`make release` 产出一个平台的商店产物：`dist/cpa-plugin-codex-auto-reset_<version>_<goos>_<goarch>.zip`（库在压缩包根目录，名为 `cpa-plugin-codex-auto-reset.<ext>`）加一行 `checksums.txt`，并自检压缩包布局符合商店的安装契约——布局不对会在本地直接失败，而不是在面板安装时才暴露。跨平台时逐个调用，产物累积到同一个 `dist/`：
+
+```bash
+make release GOOS=linux GOARCH=amd64
+make release GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc
+```
+
+发版走 `.github/workflows/release.yml`：推 `v<version>` tag 触发，CI 校验 tag 与 `main.go` 的 `pluginVersion` 一致、跑测试、构建两个 linux 架构、创建 release 并附上 `dist/*.zip` 与 `checksums.txt`。改版本时同时改 `main.go` 的 `pluginVersion` 与 `registry.json` 的 `version`（`TestRegistryMatchesPlugin` 会盯住两者一致）。
 
 ## 配置
 

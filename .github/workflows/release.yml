@@ -1,0 +1,54 @@
+name: release
+
+# Publishes the archives CPA's plugin store installs. Pushing a v<version> tag is the
+# whole trigger: the tag is the version of record, so it must match main.go's
+# pluginVersion and the asset names the store looks for.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Tag must match pluginVersion
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#v}"
+          declared_version="$(make --no-print-directory print-version)"
+          if [ "$tag_version" != "$declared_version" ]; then
+            echo "tag ${GITHUB_REF_NAME} resolves version ${tag_version}, but main.go declares ${declared_version}" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: make vet test
+
+      - name: Install aarch64 cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build linux/amd64
+        run: make release GOOS=linux GOARCH=amd64
+
+      - name: Build linux/arm64
+        env:
+          CC: aarch64-linux-gnu-gcc
+        run: make release GOOS=linux GOARCH=arm64
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes dist/*.zip dist/checksums.txt \
+            || gh release upload "$GITHUB_REF_NAME" --clobber dist/*.zip dist/checksums.txt
