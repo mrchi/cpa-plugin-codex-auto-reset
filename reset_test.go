@@ -29,11 +29,12 @@ const (
 	consumeURL = codexBaseURL + resetConsumePath
 	quotaURL   = defaultManagementBaseURL + managementResetQuotaPath
 
-	managementConfigYAML = "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - " + authFile + "\n"
 	// includedConfigYAML enables the plugin and includes the hit credential, but carries
 	// no management key: a hit reaches the pre-flight and stops there. Cases that only
 	// need the classification gate use this; reset-flow cases use managementConfigYAML.
 	includedConfigYAML = "enabled: true\ninclude_credentials:\n  - " + authFile + "\n"
+	// managementConfigYAML adds the management key on top of the included credential.
+	managementConfigYAML = includedConfigYAML + "management_key: secret-key\n"
 )
 
 // aUsableCredit is the credit listing most cases start from: it expires well after
