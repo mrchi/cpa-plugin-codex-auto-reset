@@ -77,8 +77,10 @@ func TestRegisterSurvivesBrokenConfig(t *testing.T) {
 		t.Fatalf("handleMethod: %v", errHandle)
 	}
 	decodeResult(t, raw)
-	if logs := fake.logged(); len(logs) != 1 || logs[0].Level != "warn" {
-		t.Fatalf("logs = %+v, want one warning", logs)
+	// The broken config warns, then the defaults it falls back to warn again: enabled
+	// with no included credentials.
+	if logs := fake.logged(); len(logs) != 2 || logs[0].Level != "warn" || logs[1].Level != "warn" {
+		t.Fatalf("logs = %+v, want two warnings", logs)
 	}
 }
 

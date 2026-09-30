@@ -37,10 +37,37 @@ func defaultConfig() pluginConfig {
 	}
 }
 
-// parseConfig decodes the lifecycle request. Bad input falls back to defaults with a
+// warnNoIncludedCredentials says the enabled plugin names no credential to act on, so
+// it will consume no credits. The operator has to name them before auto-reset does
+// anything (ADR-0004).
+const warnNoIncludedCredentials = "auto-reset is enabled but includes no credentials: the plugin will consume no credits"
+
+// parseConfig decodes the lifecycle request and, once a config is in effect, says so
+// when it enables the plugin without naming any credential. register and reconfigure
+// share this path, so both report the same thing on every load.
+func parseConfig(h host, request []byte) pluginConfig {
+	cfg := decodeConfig(h, request)
+	if cfg.Enabled && !hasIncludedCredential(cfg.IncludeCredentials) {
+		h.log(levelWarn, warnNoIncludedCredentials, logFields(nil))
+	}
+	return cfg
+}
+
+// hasIncludedCredential reports whether the include list names any credential after
+// dropping blank entries, mirroring isIncluded's matching rules (D8).
+func hasIncludedCredential(entries []string) bool {
+	for _, entry := range entries {
+		if strings.TrimSpace(entry) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeConfig decodes the lifecycle request. Bad input falls back to defaults with a
 // warning: returning an error rejects the registration, and panicking gets the
 // plugin fused (D9).
-func parseConfig(h host, request []byte) pluginConfig {
+func decodeConfig(h host, request []byte) pluginConfig {
 	if len(request) == 0 {
 		return defaultConfig()
 	}
