@@ -55,6 +55,46 @@ func TestLifecycleReturnsRegistration(t *testing.T) {
 			if result.Metadata.Name != pluginID {
 				t.Errorf("metadata Name = %q, want %q", result.Metadata.Name, pluginID)
 			}
+			// ConfigFields drive the management panel's config form (ADR-0005), the only
+			// presentation mechanism the host offers. Pin presence, order and types so a
+			// refactor of registration cannot silently drop the panel's config items.
+			wantFields := []struct {
+				name        string
+				typ         pluginapi.ConfigFieldType
+				description string // a substring pinning the field's semantics
+			}{
+				{"management_key", pluginapi.ConfigFieldTypeString, "credit"},
+				{"management_base_url", pluginapi.ConfigFieldTypeString, "8317"},
+				{"include_credentials", pluginapi.ConfigFieldTypeArray, "auth_index"},
+			}
+			if len(result.Metadata.ConfigFields) != len(wantFields) {
+				t.Fatalf("ConfigFields = %+v, want %d fields", result.Metadata.ConfigFields, len(wantFields))
+			}
+			for i, want := range wantFields {
+				field := result.Metadata.ConfigFields[i]
+				if field.Name != want.name {
+					t.Errorf("ConfigFields[%d].Name = %q, want %q", i, field.Name, want.name)
+				}
+				if field.Type != want.typ {
+					t.Errorf("ConfigFields[%d] (%s) Type = %q, want %q", i, field.Name, field.Type, want.typ)
+				}
+				if strings.TrimSpace(field.Description) == "" {
+					t.Errorf("ConfigFields[%d] (%s) has no description", i, field.Name)
+				}
+				if !strings.Contains(field.Description, want.description) {
+					t.Errorf("ConfigFields[%d] (%s) description %q does not mention %q", i, field.Name, field.Description, want.description)
+				}
+				if len(field.EnumValues) != 0 {
+					t.Errorf("ConfigFields[%d] (%s) has enum values, want none", i, field.Name)
+				}
+			}
+			// enabled/priority are host-injected and carry their own panel switch, so
+			// declaring them here would create a second, conflicting control.
+			for _, field := range result.Metadata.ConfigFields {
+				if field.Name == "enabled" || field.Name == "priority" {
+					t.Errorf("ConfigFields must not declare host-injected key %q", field.Name)
+				}
+			}
 			for capability, enabled := range result.Capabilities {
 				if capability != "usage_plugin" {
 					t.Errorf("unexpected capability %q", capability)

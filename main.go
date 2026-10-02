@@ -65,7 +65,7 @@ import (
 )
 
 const (
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.2.1"
 	pluginAuthor  = "mrchi"
 	pluginRepo    = "https://github.com/mrchi/cpa-plugin-codex-auto-reset"
 
@@ -159,6 +159,33 @@ type registration struct {
 	Capabilities  capabilities       `json:"capabilities"`
 }
 
+// configFields declares the plugin's private config keys to the management panel,
+// which renders them as a form. It only affects presentation: config parsing and the
+// reset flow read the same keys either way. enabled/priority are host-injected and
+// deliberately absent (ADR-0005).
+//
+// The ConfigField struct has no defaultValue/required/secret type, so defaults and
+// "empty means disabled" live in Description.
+func configFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{
+		{
+			Name:        "management_key",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "CPA 的 management.secret-key；留空则插件不消耗任何 credit",
+		},
+		{
+			Name:        "management_base_url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "CPA management API 地址，默认 http://127.0.0.1:8317",
+		},
+		{
+			Name:        "include_credentials",
+			Type:        pluginapi.ConfigFieldTypeArray,
+			Description: "纳入自动重置的凭证列表，元素为 auth 文件名或 auth_index；仅列出的凭证会被消耗 credit",
+		},
+	}
+}
+
 func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: registrationSchemaVersion,
@@ -167,6 +194,7 @@ func pluginRegistration() registration {
 			Version:          pluginVersion,
 			Author:           pluginAuthor,
 			GitHubRepository: pluginRepo,
+			ConfigFields:     configFields(),
 		},
 		Capabilities: capabilities{UsagePlugin: true},
 	}
