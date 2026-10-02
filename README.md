@@ -8,16 +8,17 @@
 
 触发条件（全部满足）：
 
-- 上游 429 且错误体 `type == "usage_limit_reached"`
+- 凭证为 codex 订阅渠道：记录里 `provider == "codex"` 且 `auth_type == "oauth"`，其它渠道的记录直接忽略
+- 上游 429（记录的失败状态码为 429）且错误体 `type == "usage_limit_reached"`（该字段在顶层或 `error` 嵌套里均可）
 - 窗口为周窗：`limit_window_minutes == 10080`，字段缺失时以 `resets_in_seconds > 18000`（或由 `resets_at` 推算）兜底
-- 自然恢复在一天之外：`resets_in_seconds > 86400`
+- 自然恢复在一天之外：解析出的剩余秒数 > 86400（`resets_in_seconds` 优先，缺失时由 `resets_at` 推算）
 - 插件 `enabled` 为真，且凭证在 `include_credentials` 中
 
-命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `expires_at` 最早且未过期的可用 credit → 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却。
+命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `status == available`、id 非空、尚未过期且 `expires_at` 最早的 credit（`expires_at` 为空视为永不过期，排在有到期日的之后）→ 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却。
 
 任何一步失败（无可用 credit、`nothing_to_reset`、`no_credit`、网络或 HTTP 错误、清冷却失败）都只记日志，回落 CPA 默认冷却行为，不补偿。唯一的重试是只读的 credit 列表：401/403 直接结束，其它失败流程内最多共试 3 次；consume 与清冷却从不重试。当前客户端请求照常返回错误，插件不做请求重放。
 
-同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、consume 已发出）5 分钟内不再触发，临时故障不抑制（内存态，随 CPA 重启清空）。
+同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、consume 已尝试）5 分钟内不再触发，临时故障不抑制（内存态，随 CPA 重启清空）。
 
 ## 安装
 
@@ -66,9 +67,10 @@ plugins:
     cpa-plugin-codex-auto-reset:
       enabled: true                          # 总开关；缺失视为 true
       management_key: "<CPA management key>"  # 必需：缺失时插件不消耗任何 credit（见下）
-      management_base_url: "http://127.0.0.1:8317"  # 默认值
+      management_base_url: "http://127.0.0.1:8317"  # 默认值；留空或只有空白同样落回默认
       include_credentials:                    # 白名单：只有列出的凭证会被插件消耗 credit
         - "codex-user@example.com.json"       # auth 文件名
+        - "<auth_id>"                         # 或记录的 auth id
         - "<auth_index>"                      # 或运行时 auth index
 ```
 
@@ -78,11 +80,11 @@ plugins:
 
 作用范围从旧的排除名单改为纳入名单 `include_credentials`，且默认**为空**。旧配置里的排除键已不再被识别，插件也不会对其做任何兼容。
 
-默认不对任何凭证动作：升级后必须显式在 `include_credentials` 中列出要纳入的凭证，否则插件启用却不会消耗任何 credit。为提示这一状态，插件在 `enabled` 为真但 `include_credentials` 为空时会在加载/改配置阶段记一条 warn。
+默认不对任何凭证动作：升级后必须显式在 `include_credentials` 中列出要纳入的凭证，否则插件启用却不会消耗任何 credit。为提示这一状态，插件在 `enabled` 为真但 `include_credentials` 为空（或只含空白项，空白项从不匹配任何凭证）时会在加载/改配置阶段记一条 warn。
 
 `management_key` 取自 CPA 的 `management.secret-key`；插件经本机 management API `POST /v0/management/reset-quota` 清冷却（本机访问不受 `management.allow-remote` 限制，但该 API 仍需 key 非空）。
 
-**`management_key` 缺失时插件不做任何事**：清不掉冷却就消费 credit，等于白烧一张卡还让凭证被锁到旧的 reset 时间——比不装插件更糟。所以命中后若 key 为空，插件立即中止并在日志里记 warn，不发任何上游请求。
+**`management_key` 缺失时插件不做任何事**：清不掉冷却就消费 credit，等于白烧一张卡还让凭证被锁到旧的 reset 时间——比不装插件更糟。所以命中后若 key 为空，插件立即中止并在日志里记 warn，不发任何上游请求。记录不带 `auth_index` 时同理中止（读不了凭证、也清不了冷却）。
 
 ## 已知上限
 
