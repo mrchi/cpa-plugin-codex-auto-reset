@@ -4,11 +4,11 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** ready-for-review
 
-- [ ] 注册与改配置两条路径返回的 metadata 都含恰好三个配置字段，顺序为 `management_key`、`management_base_url`、`include_credentials`
-- [ ] 三者类型分别为 `string`、`string`、`array`，且不属于 enum（`EnumValues` 为空）
-- [ ] 每条字段的 `Description` 非空且为中文，包含上述各自语义
-- [ ] 不存在名为 `enabled` 或 `priority` 的配置字段
-- [ ] `schema_version` 仍为 `1`，`metadata` 必填四项与 `capabilities` 不变
-- [ ] 既有 `TestLifecycleReturnsRegistration` 扩展后覆盖以上断言，`go test ./...` 通过；测试不新增接缝，沿用 `handleMethod` + `decodeResult`
+- [x] 注册与改配置两条路径返回的 metadata 都含恰好三个配置字段，顺序为 `management_key`、`management_base_url`、`include_credentials`
+- [x] 三者类型分别为 `string`、`string`、`array`，且不属于 enum（`EnumValues` 为空）
+- [x] 每条字段的 `Description` 非空且为中文，包含上述各自语义
+- [x] 不存在名为 `enabled` 或 `priority` 的配置字段
+- [x] `schema_version` 仍为 `1`，`metadata` 必填四项与 `capabilities` 不变
+- [x] 既有 `TestLifecycleReturnsRegistration` 扩展后覆盖以上断言，`go test ./...` 通过；测试不新增接缝，沿用 `handleMethod` + `decodeResult`

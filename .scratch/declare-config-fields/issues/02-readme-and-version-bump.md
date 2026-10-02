@@ -4,8 +4,8 @@
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** ready-for-review
 
-- [ ] README"配置"段补一句：这些配置键会在面板中渲染为表单
-- [ ] `pluginVersion` 与 `registry.json` 的 `version` 均为 `0.2.1`，`TestRegistryMatchesPlugin` 通过
-- [ ] `go test ./...` 全绿
+- [x] README"配置"段补一句：这些配置键会在面板中渲染为表单
+- [x] `pluginVersion` 与 `registry.json` 的 `version` 均为 `0.2.1`，`TestRegistryMatchesPlugin` 通过
+- [x] `go test ./...` 全绿
