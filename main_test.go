@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -59,9 +60,9 @@ func TestLifecycleReturnsRegistration(t *testing.T) {
 			// presentation mechanism the host offers. Pin presence, order and types so a
 			// refactor of registration cannot silently drop the panel's config items.
 			wantFields := []struct {
-				name        string
-				typ         pluginapi.ConfigFieldType
-				description string // a substring pinning the field's semantics
+				name          string
+				typ           pluginapi.ConfigFieldType
+				wantSubstring string // a substring pinning the field's semantics
 			}{
 				{"management_key", pluginapi.ConfigFieldTypeString, "credit"},
 				{"management_base_url", pluginapi.ConfigFieldTypeString, "8317"},
@@ -81,8 +82,13 @@ func TestLifecycleReturnsRegistration(t *testing.T) {
 				if strings.TrimSpace(field.Description) == "" {
 					t.Errorf("ConfigFields[%d] (%s) has no description", i, field.Name)
 				}
-				if !strings.Contains(field.Description, want.description) {
-					t.Errorf("ConfigFields[%d] (%s) description %q does not mention %q", i, field.Name, field.Description, want.description)
+				if !strings.Contains(field.Description, want.wantSubstring) {
+					t.Errorf("ConfigFields[%d] (%s) description %q does not mention %q", i, field.Name, field.Description, want.wantSubstring)
+				}
+				// Descriptions are user-facing and the repo documents Chinese for
+				// user-facing prose, so pin non-ASCII rather than trusting review.
+				if !strings.ContainsFunc(field.Description, func(r rune) bool { return r > unicode.MaxASCII }) {
+					t.Errorf("ConfigFields[%d] (%s) description is not Chinese: %q", i, field.Name, field.Description)
 				}
 				if len(field.EnumValues) != 0 {
 					t.Errorf("ConfigFields[%d] (%s) has enum values, want none", i, field.Name)
