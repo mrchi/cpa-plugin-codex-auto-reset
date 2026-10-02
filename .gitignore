@@ -5,3 +5,4 @@ dist/
 *.dylib
 *.h
 /cpa-plugin-codex-auto-reset
+.scratch/
