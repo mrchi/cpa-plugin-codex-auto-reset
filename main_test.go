@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -64,8 +66,6 @@ func TestLifecycleReturnsRegistration(t *testing.T) {
 				typ           pluginapi.ConfigFieldType
 				wantSubstring string // a substring pinning the field's semantics
 			}{
-				{"management_key", pluginapi.ConfigFieldTypeString, "credit"},
-				{"management_base_url", pluginapi.ConfigFieldTypeString, "8317"},
 				{"include_credentials", pluginapi.ConfigFieldTypeArray, "auth_index"},
 			}
 			if len(result.Metadata.ConfigFields) != len(wantFields) {
@@ -153,4 +153,38 @@ func TestShutdownSucceeds(t *testing.T) {
 		t.Fatalf("handleMethod: %v", errHandle)
 	}
 	decodeResult(t, raw)
+}
+
+// TestShutdownWaitsForInFlightFlow pins that the shutdown hook does not return while a
+// reset flow is still running. The host frees the host api struct and unloads this
+// library the moment that hook returns, and it only waits for the callbacks it started
+// itself — a flow still alive here would resume into freed memory and unmapped code.
+func TestShutdownWaitsForInFlightFlow(t *testing.T) {
+	useFakeClock(t, testClock)
+	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+
+	// Hold the flow inside its listing call: in production that call takes seconds (three
+	// attempts, a second apart), which is the window a plugin reload lands in.
+	holding := make(chan struct{})
+	fake.httpHandler = func(request httpRequest) (pluginapi.HTTPResponse, error) {
+		<-holding
+		return fake.answer(request)
+	}
+
+	registerConfig(t, fake, includedConfigYAML)
+	sendUsage(t, fake, hitRecord())
+	waitFor(t, func() bool { return fake.requestCount() == 1 })
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(holding)
+	}()
+
+	shutdownPlugin()
+	fake.markClosed()
+	// The flow has to be over by now: anything it does from here is a callback into the
+	// host the plugin was just unloaded from.
+	waitForLog(t, fake, reasonCooldownCleared)
+	if calls := fake.callsAfterClose(); len(calls) != 0 {
+		t.Fatalf("host callbacks after shutdown returned = %v, want none", calls)
+	}
 }

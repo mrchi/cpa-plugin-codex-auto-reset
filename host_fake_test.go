@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -25,6 +26,16 @@ type fakeHost struct {
 
 	httpCalls []httpRequest
 	authGets  []string
+	// closed stands for the real host after cliproxyPluginShutdown returned: the host
+	// api struct is freed and the library is unloaded, so any callback that arrives now
+	// is a callback into freed memory. afterClose records them.
+	closed     bool
+	afterClose []string
+	// cooldownCleared records the auth indexes handed to reset_cooldown, and
+	// cooldownErr makes every such call fail (an old host without the RPC, or a
+	// host-side reset error).
+	cooldownCleared []string
+	cooldownErr     error
 	// trace records every callback in order, so a test can assert a sequence that
 	// spans callback kinds (auth.get → http.do …).
 	trace []string
@@ -76,12 +87,18 @@ func (f *fakeHost) withCredential(authIndex, authJSON string) *fakeHost {
 func (f *fakeHost) log(level, message string, fields map[string]any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		f.afterClose = append(f.afterClose, "log "+message)
+	}
 	f.logs = append(f.logs, fakeLog{Level: level, Message: message, Fields: fields})
 }
 
 func (f *fakeHost) authGet(authIndex string) (pluginapi.HostAuthGetResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		f.afterClose = append(f.afterClose, "auth.get "+authIndex)
+	}
 	f.authGets = append(f.authGets, authIndex)
 	f.trace = append(f.trace, "auth.get "+authIndex)
 	entry, okAuth := f.auths[authIndex]
@@ -91,8 +108,38 @@ func (f *fakeHost) authGet(authIndex string) (pluginapi.HostAuthGetResponse, err
 	return entry, nil
 }
 
+func (f *fakeHost) resetCooldown(authIndex string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		f.afterClose = append(f.afterClose, "reset_cooldown "+authIndex)
+	}
+	f.cooldownCleared = append(f.cooldownCleared, authIndex)
+	f.trace = append(f.trace, "reset_cooldown "+authIndex)
+	return f.cooldownErr
+}
+
+// failCooldown makes every reset_cooldown callback fail.
+func (f *fakeHost) failCooldown(err error) *fakeHost {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cooldownErr = err
+	return f
+}
+
+// cooldownsCleared returns the auth indexes reset_cooldown was called with, so a test
+// can pin both the count and the credential.
+func (f *fakeHost) cooldownsCleared() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cooldownCleared...)
+}
+
 func (f *fakeHost) httpDo(request httpRequest) (pluginapi.HTTPResponse, error) {
 	f.mu.Lock()
+	if f.closed {
+		f.afterClose = append(f.afterClose, "http.do "+request.Method+" "+request.URL)
+	}
 	f.httpCalls = append(f.httpCalls, request)
 	f.trace = append(f.trace, "http.do "+request.Method+" "+request.URL)
 	handler := f.httpHandler
@@ -103,6 +150,22 @@ func (f *fakeHost) httpDo(request httpRequest) (pluginapi.HTTPResponse, error) {
 		return handler(request)
 	}
 	return f.answer(request)
+}
+
+// markClosed puts the fake in the state the real host is in once
+// cliproxyPluginShutdown returned, so any later callback is recorded as a callback into
+// freed memory rather than silently served.
+func (f *fakeHost) markClosed() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+}
+
+// callsAfterClose returns every callback that arrived after markClosed.
+func (f *fakeHost) callsAfterClose() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.afterClose...)
 }
 
 // answer returns the scripted result for one request, so a handler that only needs to
@@ -154,6 +217,15 @@ func (f *fakeHost) requestCount() int {
 	return len(f.httpCalls)
 }
 
+// assertUpstreamCalls pins how many host.http.do calls a flow made. The cooldown clear
+// is a host RPC, so it never appears in this count.
+func assertUpstreamCalls(t *testing.T, fake *fakeHost, want int) {
+	t.Helper()
+	if got := fake.requestCount(); got != want {
+		t.Fatalf("http.do calls = %d, want %d (the cooldown clear is an RPC, not an HTTP call)", got, want)
+	}
+}
+
 func (f *fakeHost) authGetCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -185,6 +257,15 @@ func (c *fakeClock) advance(elapsed time.Duration) {
 	c.at = c.at.Add(elapsed)
 }
 
+// TestMain zeroes the listing retry delay once, before any flow goroutine exists: three
+// attempts a second apart would dominate the suite. Doing it here rather than in
+// useFakeClock keeps the variable off the write path — a test writing it while a flow
+// goroutine reads it is a data race.
+func TestMain(m *testing.M) {
+	creditsListRetryDelay = 0
+	os.Exit(m.Run())
+}
+
 // useFakeClock hands one test a clock it controls and a fresh debounce state, so no
 // case waits for real time and no case's suppression window leaks into the next one.
 // Both are process-wide values (state.go), which is why the seam is a single helper.
@@ -193,12 +274,9 @@ func useFakeClock(t *testing.T, at time.Time) *fakeClock {
 	fake := &fakeClock{at: at}
 	restore := setClock(fake.now)
 	activeDebounce = newDebounce()
-	previousDelay := creditsListRetryDelay
-	creditsListRetryDelay = 0
 	t.Cleanup(func() {
 		restore()
 		activeDebounce = newDebounce()
-		creditsListRetryDelay = previousDelay
 	})
 	return fake
 }

@@ -57,7 +57,9 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -65,7 +67,7 @@ import (
 )
 
 const (
-	pluginVersion = "0.2.1"
+	pluginVersion = "0.3.0"
 	pluginAuthor  = "mrchi"
 	pluginRepo    = "https://github.com/mrchi/cpa-plugin-codex-auto-reset"
 
@@ -129,7 +131,34 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() { shutdownPlugin() }
+
+// resetFlows counts the detached reset flows, so shutdown can wait for them. Add always
+// happens inside a host→plugin callback, and the host drains those before it calls this
+// hook (pluginhost client_guard.go), so every flow is already counted by the time
+// shutdownPlugin waits (D26).
+var resetFlows sync.WaitGroup
+
+// shutdownGrace bounds that wait. It is a ceiling, not a schedule: the flows it waits for
+// are usually between two host calls and end at once. The exception is a flow parked in a
+// hung host.http.do, which has no cancel (D20) — past the grace the host unloads anyway,
+// which is the crash this wait exists to narrow.
+const shutdownGrace = 5 * time.Second
+
+// shutdownPlugin stands between the last host callback and the host freeing the host api
+// struct and unloading this library. Returning while a flow is still running would send
+// that flow back into freed memory and unmapped code.
+func shutdownPlugin() {
+	done := make(chan struct{})
+	go func() {
+		resetFlows.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+	}
+}
 
 // handleMethod routes one RPC call (D6). Unknown methods are reported in an error
 // envelope with a zero return code, not as transport failures.
@@ -164,20 +193,10 @@ type registration struct {
 // reset flow read the same keys either way. enabled/priority are host-injected and
 // deliberately absent (ADR-0005).
 //
-// The ConfigField struct has no defaultValue/required/secret type, so defaults and
-// "empty means disabled" live in Description.
+// The ConfigField struct has no defaultValue/required/secret type, so "empty means
+// disabled" lives in Description.
 func configFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{
-			Name:        "management_key",
-			Type:        pluginapi.ConfigFieldTypeString,
-			Description: "CPA 的 management.secret-key；留空则插件不消耗任何 credit",
-		},
-		{
-			Name:        "management_base_url",
-			Type:        pluginapi.ConfigFieldTypeString,
-			Description: "CPA management API 地址，默认 http://127.0.0.1:8317",
-		},
 		{
 			Name:        "include_credentials",
 			Type:        pluginapi.ConfigFieldTypeArray,
@@ -219,7 +238,7 @@ func handleUsage(h host, request []byte) ([]byte, error) {
 	}
 	h.log(level, result.Reason, classificationFields(record, result))
 	if result.Hit {
-		startAutoReset(activeDebounce, h, cfg, record)
+		startAutoReset(activeDebounce, h, record)
 	}
 	return okEnvelope(struct{}{})
 }

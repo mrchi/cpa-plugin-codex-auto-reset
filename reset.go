@@ -12,12 +12,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// Upstream and management endpoints (D14, D16, D17, D19).
+// Upstream endpoints (D14, D16, D17).
 const (
-	codexBaseURL             = "https://chatgpt.com/backend-api"
-	resetCreditsPath         = "/wham/rate-limit-reset-credits"
-	resetConsumePath         = "/wham/rate-limit-reset-credits/consume"
-	managementResetQuotaPath = "/v0/management/reset-quota"
+	codexBaseURL     = "https://chatgpt.com/backend-api"
+	resetCreditsPath = "/wham/rate-limit-reset-credits"
+	resetConsumePath = "/wham/rate-limit-reset-credits/consume"
 
 	codexUserAgent  = "codex_cli_rs/0.156.1"
 	codexOriginator = "codex_cli_rs"
@@ -41,17 +40,16 @@ const (
 // Reset-flow log messages, one per outcome, so credit consumption stays auditable
 // after the fact (spec story 17).
 const (
-	reasonAuthUnreadable     = "auto-reset: cannot read credential: no reset"
-	reasonNoAccessToken      = "auto-reset: credential carries no access token: no reset"
-	reasonUUIDFailed         = "auto-reset: cannot generate an idempotency key: no reset"
-	reasonCreditsListFailed  = "auto-reset: cannot list reset credits: no reset"
-	reasonNoAvailableCredit  = "auto-reset: no available reset credit: no reset"
-	reasonConsumeFailed      = "auto-reset: reset credit consume failed: no reset"
-	reasonResetSucceeded     = "auto-reset: reset credit consumed"
-	reasonCooldownCleared    = "auto-reset: credential cooldown cleared"
-	reasonCooldownFailed     = "auto-reset: credential cooldown clear failed"
-	reasonManagementKeyEmpty = "auto-reset: management_key is not configured: no reset"
-	reasonNoAuthIndex        = "auto-reset: record carries no auth index: no reset"
+	reasonAuthUnreadable    = "auto-reset: cannot read credential: no reset"
+	reasonNoAccessToken     = "auto-reset: credential carries no access token: no reset"
+	reasonUUIDFailed        = "auto-reset: cannot generate an idempotency key: no reset"
+	reasonCreditsListFailed = "auto-reset: cannot list reset credits: no reset"
+	reasonNoAvailableCredit = "auto-reset: no available reset credit: no reset"
+	reasonConsumeFailed     = "auto-reset: reset credit consume failed: no reset"
+	reasonResetSucceeded    = "auto-reset: reset credit consumed"
+	reasonCooldownCleared   = "auto-reset: credential cooldown cleared"
+	reasonCooldownFailed    = "auto-reset: credential cooldown clear failed"
+	reasonNoAuthIndex       = "auto-reset: record carries no auth index: no reset"
 )
 
 // resetCreditsResponse is the GET payload. Unknown fields (the real response carries
@@ -76,19 +74,14 @@ type consumeResponse struct {
 	Code string `json:"code"`
 }
 
-type managementResetQuotaRequest struct {
-	AuthIndex string `json:"auth_index"`
-}
-
 // creditsListRetryDelay is the pause before each listing retry. ponytail: fixed
 // delay, add backoff if upstream starts rate-limiting the retries. Tests zero it.
 var creditsListRetryDelay = time.Second
 
 // resetFlow is one run of the auto-reset flow for one usage record: the host it talks
-// through, the configuration it started with, and the record that triggered it.
+// through and the record that triggered it.
 type resetFlow struct {
 	h      host
-	cfg    pluginConfig
 	record pluginapi.UsageRecord
 }
 
@@ -100,15 +93,8 @@ func (f resetFlow) log(level, reason string, extra map[string]any) {
 // startAutoReset dispatches the reset flow for one hit signal and returns immediately
 // (D11); a signal arriving while a flow is running or inside the suppression window
 // is dropped with a debug log rather than queued (D12).
-func startAutoReset(guard *debounce, h host, cfg pluginConfig, record pluginapi.UsageRecord) {
-	flow := resetFlow{h: h, cfg: cfg, record: record}
-	// Pre-flight: without a management key the cooldown can never be cleared, so a
-	// consumed credit would leave the credential locked until the old reset time and
-	// buy nothing. Stop before spending anything (spec story 16).
-	if strings.TrimSpace(cfg.ManagementKey) == "" {
-		flow.log(levelWarn, reasonManagementKeyEmpty, nil)
-		return
-	}
+func startAutoReset(guard *debounce, h host, record pluginapi.UsageRecord) {
+	flow := resetFlow{h: h, record: record}
 	// host.auth.get only resolves an auth index, and the debounce is keyed by it: a
 	// record without one can never be reset and must not share a debounce entry.
 	if record.AuthIndex == "" {
@@ -121,7 +107,9 @@ func startAutoReset(guard *debounce, h host, cfg pluginConfig, record pluginapi.
 	}
 	// The goroutine captures this guard, so a later reconfigure or test cannot redirect
 	// the flow's bookkeeping at another debounce.
+	resetFlows.Add(1)
 	go func() {
+		defer resetFlows.Done()
 		guard.finish(record.AuthIndex, flow.run())
 	}()
 }
@@ -148,9 +136,13 @@ func (f resetFlow) run() bool {
 		return true
 	}
 
-	credits, okList, tokenRejected := f.listCredits(creds)
+	credits, okList := f.listCredits(creds)
 	if !okList {
-		return tokenRejected
+		// The listing just exhausted its retries. Treating that as settled is what keeps a
+		// permanently broken listing endpoint from being called three more times for every
+		// 429 record that keeps arriving: the suppression window costs seconds against a
+		// window measured in days (D12).
+		return true
 	}
 	credit, okCredit := pickCredit(credits)
 	if !okCredit {
@@ -182,11 +174,11 @@ func (f resetFlow) run() bool {
 	return true
 }
 
-// listCredits fetches the account's reset credits. A 401 or 403 means the stored
-// token is rejected, which no retry fixes (D21), so it fails at once with
-// tokenRejected set; any other failure is retried up to creditsListAttempts times.
-// Either way a failed listing is logged once and no consume is sent.
-func (f resetFlow) listCredits(creds authCredentials) (credits []resetCredit, ok, tokenRejected bool) {
+// listCredits fetches the account's reset credits, retrying up to creditsListAttempts
+// times. A 401 or 403 means the stored token is rejected, which no retry fixes (D21), so
+// it fails at once; any other failure is retried. Either way a failed listing is logged
+// once and no consume is sent.
+func (f resetFlow) listCredits(creds authCredentials) (credits []resetCredit, ok bool) {
 	var failure map[string]any
 	for attempt := 1; attempt <= creditsListAttempts; attempt++ {
 		if attempt > 1 {
@@ -203,7 +195,7 @@ func (f resetFlow) listCredits(creds authCredentials) (credits []resetCredit, ok
 		}
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 			f.log(levelWarn, reasonCreditsListFailed, map[string]any{"status_code": response.StatusCode, "attempts": attempt})
-			return nil, false, true
+			return nil, false
 		}
 		if !isSuccessStatus(response.StatusCode) {
 			failure = map[string]any{"status_code": response.StatusCode}
@@ -214,11 +206,11 @@ func (f resetFlow) listCredits(creds authCredentials) (credits []resetCredit, ok
 			failure = map[string]any{"error": errUnmarshal.Error()}
 			continue
 		}
-		return listing.Credits, true, false
+		return listing.Credits, true
 	}
 	failure["attempts"] = creditsListAttempts
 	f.log(levelWarn, reasonCreditsListFailed, failure)
-	return nil, false, false
+	return nil, false
 }
 
 // consume redeems one credit by id. Only reset and already_redeemed mean the credit is
@@ -261,37 +253,18 @@ func (f resetFlow) consume(creds authCredentials, creditID, redeemID string) (st
 	}
 }
 
-// isSuccessStatus reports whether an upstream call answered 2xx. CPA's management API is
-// stricter than the upstream one: clearCooldown accepts exactly 200 (D19).
+// isSuccessStatus reports whether an upstream call answered 2xx.
 func isSuccessStatus(status int) bool {
 	return status >= 200 && status < 300
 }
 
-// clearCooldown asks CPA's management API to drop the credential's cooldown, so the
-// restored quota is schedulable again (D19, spec story 11). It runs only after a
-// credited consume and never retries: a failure is logged and the flow ends. A blank
-// key never reaches here — startAutoReset stops the flow before it spends anything.
+// clearCooldown asks the host to drop the credential's local cooldown, so the restored
+// quota is schedulable again (ADR-0006). It runs only after a credited consume and never
+// retries: a failure is logged and the flow ends. A host below v8.0.12 has no such RPC
+// and lands here too, leaving the default cooldown in place.
 func (f resetFlow) clearCooldown() {
-	body, errMarshal := json.Marshal(managementResetQuotaRequest{AuthIndex: f.record.AuthIndex})
-	if errMarshal != nil {
-		f.log(levelWarn, reasonCooldownFailed, map[string]any{"error": errMarshal.Error()})
-		return
-	}
-	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+f.cfg.ManagementKey)
-	headers.Set("Content-Type", "application/json")
-	response, errDo := f.h.httpDo(httpRequest{
-		Method:  http.MethodPost,
-		URL:     strings.TrimRight(f.cfg.ManagementBaseURL, "/") + managementResetQuotaPath,
-		Headers: headers,
-		Body:    body,
-	})
-	if errDo != nil {
-		f.log(levelWarn, reasonCooldownFailed, map[string]any{"error": errDo.Error()})
-		return
-	}
-	if response.StatusCode != http.StatusOK {
-		f.log(levelWarn, reasonCooldownFailed, map[string]any{"status_code": response.StatusCode})
+	if errReset := f.h.resetCooldown(f.record.AuthIndex); errReset != nil {
+		f.log(levelWarn, reasonCooldownFailed, map[string]any{"error": errReset.Error()})
 		return
 	}
 	f.log(levelInfo, reasonCooldownCleared, nil)

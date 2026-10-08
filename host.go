@@ -16,10 +16,13 @@ type host interface {
 	log(level, message string, fields map[string]any)
 	authGet(authIndex string) (pluginapi.HostAuthGetResponse, error)
 	httpDo(req httpRequest) (pluginapi.HTTPResponse, error)
+	resetCooldown(authIndex string) error
 }
 
-// httpRequest is the wire form of host.http.do. pluginapi.HTTPRequest carries no
-// JSON tags, so marshalling it would produce keys the host does not read.
+// httpRequest is the wire form of host.http.do: snake_case keys, as the host's
+// rpcHostHTTPRequest declares them (pluginhost host_callbacks.go). pluginapi.HTTPRequest
+// would decode the same way, since encoding/json matches keys case-insensitively — the
+// wire struct is here to state the contract rather than to rely on that (D23).
 type httpRequest struct {
 	Method  string      `json:"method"`
 	URL     string      `json:"url"`
@@ -66,6 +69,17 @@ func (cgoHost) httpDo(request httpRequest) (pluginapi.HTTPResponse, error) {
 	}
 	errCall := callHost(pluginabi.MethodHostHTTPDo, payload, &response)
 	return response, errCall
+}
+
+// resetCooldown asks the host to drop the credential's routing cooldown in-process, the
+// replacement for the deprecated management endpoint (ADR-0006).
+func (cgoHost) resetCooldown(authIndex string) error {
+	var response pluginapi.HostRoutingResetCooldownResponse
+	payload, errMarshal := json.Marshal(pluginapi.HostRoutingResetCooldownRequest{AuthIndex: authIndex})
+	if errMarshal != nil {
+		return errMarshal
+	}
+	return callHost(pluginabi.MethodHostRoutingResetCooldown, payload, &response)
 }
 
 // Log levels host.log recognises, plus levelDebug, which it maps to debug by not

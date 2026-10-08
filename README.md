@@ -2,7 +2,7 @@
 
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 插件：当 codex 订阅渠道的**周用量窗口**用尽、且账号持有 reset credit 时，自动消耗一张 credit 重置限额并清除 CPA 对该凭证的本地冷却，无需人工介入。
 
-判定与流程的取舍见 `docs/adr/`，术语见 `CONTEXT.md`，实现决策见 `.scratch/auto-reset-on-weekly-exhaustion/decisions.md`。
+判定与流程的取舍见 `docs/adr/`，术语见 `CONTEXT.md`，需求与实现决策见 `docs/features/auto-reset-on-weekly-exhaustion/`（`spec.md` 的用户故事编号、`decisions.md` 的 `D<n>` 编号被代码注释直接引用）。
 
 ## 行为
 
@@ -14,11 +14,11 @@
 - 自然恢复在一天之外：解析出的剩余秒数 > 86400（`resets_in_seconds` 优先，缺失时由 `resets_at` 推算）
 - 插件 `enabled` 为真，且凭证在 `include_credentials` 中
 
-命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `status == available`、id 非空、尚未过期且 `expires_at` 最早的 credit（`expires_at` 为空视为永不过期，排在有到期日的之后）→ 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却。
+命中后：取凭证的 access token 与 account ID → 列 reset credit → 选 `status == available`、id 非空、尚未过期且 `expires_at` 最早的 credit（`expires_at` 为空视为永不过期，排在有到期日的之后）→ 带流程级幂等键 consume → **只有** `reset` / `already_redeemed` 视为成功 → 成功后清 CPA 冷却（经 host 回调 `host.routing.reset_cooldown`，进程内 RPC，不重写 auth 文件）。
 
 任何一步失败（无可用 credit、`nothing_to_reset`、`no_credit`、网络或 HTTP 错误、清冷却失败）都只记日志，回落 CPA 默认冷却行为，不补偿。唯一的重试是只读的 credit 列表：401/403 直接结束，其它失败流程内最多共试 3 次；consume 与清冷却从不重试。当前客户端请求照常返回错误，插件不做请求重放。
 
-同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、consume 已尝试）5 分钟内不再触发，临时故障不抑制（内存态，随 CPA 重启清空）。
+同凭证并发命中只跑一次流程；流程有定论后（credit 已消耗、无可用 credit、token 失效、列表重试耗尽、consume 已尝试）5 分钟内不再触发，只有凭证本身读不到时不抑制（内存态，随 CPA 重启清空）。
 
 ## 安装
 
@@ -66,25 +66,25 @@ plugins:
   configs:
     cpa-plugin-codex-auto-reset:
       enabled: true                          # 总开关；缺失视为 true
-      management_key: "<CPA management key>"  # 必需：缺失时插件不消耗任何 credit（见下）
-      management_base_url: "http://127.0.0.1:8317"  # 默认值；留空或只有空白同样落回默认
       include_credentials:                    # 白名单：只有列出的凭证会被插件消耗 credit
         - "codex-user@example.com.json"       # auth 文件名
         - "<auth_id>"                         # 或记录的 auth id
         - "<auth_index>"                      # 或运行时 auth index
 ```
 
-插件在注册响应里声明了这三个私有键，管理面板会据此把它们渲染成表单，可不开 yaml 直接填写；`enabled` 由 host 注入、面板另有启用开关，不作为插件字段声明。
+插件在注册响应里声明了这个私有键，管理面板会据此把它渲染成表单，可不开 yaml 直接填写；`enabled` 由 host 注入、面板另有启用开关，不作为插件字段声明。
+
+需要 **CPA v8.0.12 或更高**：清冷却经 host 回调 `host.routing.reset_cooldown` 完成，不再需要 management key 或本机 management HTTP 服务。
 
 ### 升级必读（破坏性变更）
 
-作用范围从旧的排除名单改为纳入名单 `include_credentials`，且默认**为空**。旧配置里的排除键已不再被识别，插件也不会对其做任何兼容。
+**0.3.0**：清冷却从 management HTTP API `POST /v0/management/reset-quota` 改为 host 回调。`management_key`、`management_base_url` 两个键不再被读取，旧配置里可以直接删掉（留着也无害，插件不读未知键）。
+
+**0.2.0**：作用范围从旧的排除名单改为纳入名单 `include_credentials`，且默认**为空**。旧配置里的排除键已不再被识别，插件也不会对其做任何兼容。
 
 默认不对任何凭证动作：升级后必须显式在 `include_credentials` 中列出要纳入的凭证，否则插件启用却不会消耗任何 credit。为提示这一状态，插件在 `enabled` 为真但 `include_credentials` 为空（或只含空白项，空白项从不匹配任何凭证）时会在加载/改配置阶段记一条 warn。
 
-`management_key` 取自 CPA 的 `management.secret-key`；插件经本机 management API `POST /v0/management/reset-quota` 清冷却（本机访问不受 `management.allow-remote` 限制，但该 API 仍需 key 非空）。
-
-**`management_key` 缺失时插件不做任何事**：清不掉冷却就消费 credit，等于白烧一张卡还让凭证被锁到旧的 reset 时间——比不装插件更糟。所以命中后若 key 为空，插件立即中止并在日志里记 warn，不发任何上游请求。记录不带 `auth_index` 时同理中止（读不了凭证、也清不了冷却）。
+记录不带 `auth_index` 时中止并记 warn：读不了凭证也清不了冷却，继续消耗只会白烧一张 credit。
 
 ## 已知上限
 
@@ -92,7 +92,9 @@ plugins:
 - `host.http.do` 无超时可设，上游挂死会占住该凭证的 reset 流程（不影响 CPA 自身的 usage 队列）；代码中以 `ponytail:` 注释标注。
 - 不刷新 access token：token 过期即视为一次失败，回落默认行为。
 - 5 小时窗用尽不触发。
-- 需要配置 `management_key`（CPA 的 `management.secret-key`），这是相对"只在 credit 快过期时兑换"类插件的额外运维负担——换来的是凭证冷却能被清掉、渠道立刻恢复可用。
+- 最低支持 CPA v8.0.12：更低的 host 上没有 `host.routing.reset_cooldown` 这个回调，调用被 host 报为不支持的 callback（`host_call_failed`），插件不做运行时版本探测、也没有旧 HTTP 回退，表现为 credit 已消耗但清冷却失败（日志记 `credential cooldown clear failed`），凭证要等旧的 reset 时间才恢复调度。
+- 清冷却只清 CPA 对该凭证的**本地冷却状态**，不改变上游实际限额。
+- 卸载或重启时插件最多等 5 秒等在跑的 reset 流程结束。host 收回 host 回调并卸载本库时不会等插件自己起的 goroutine，所以在跑的流程必须先结束；卡在挂死的上游请求里的流程等不到（见上一条），这种情况下卸载仍会中断它。
 
 ## 日志
 

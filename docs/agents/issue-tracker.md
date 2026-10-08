@@ -1,6 +1,10 @@
 # Issue tracker: Local Markdown
 
-Issues and specs for this repo live as markdown files in `.scratch/`.
+Issues and specs for this repo live as markdown files in `.scratch/`. The directory is gitignored: it holds work in flight, not durable record.
+
+## Promotion
+
+Anything the repository cites permanently — a spec whose user stories code comments reference by number, a decisions doc whose `D<n>` entries code comments reference — must be promoted to `docs/features/<feature-slug>/` (one directory per feature, same `spec.md` / `decisions.md` filenames) and removed from `.scratch/`, so a clone can resolve every citation. Decide by citation, not by completion: an unreferenced spec can stay in `.scratch/` after the work lands.
 
 ## Conventions
 

@@ -397,16 +397,16 @@ func TestUsageHandleClassifiesExhaustion(t *testing.T) {
 			}
 
 			if test.wantReason == reasonHit {
-				// A hit hands the record to the reset flow, which stops at the pre-flight
-				// because these cases configure no management key: waiting for its line
-				// keeps the case deterministic and pins that nothing is spent.
-				waitForLog(t, fake, reasonManagementKeyEmpty)
+				// A hit hands the record to the reset flow, which runs off this goroutine
+				// (D11). The fake host holds no such credential, so the flow ends at the
+				// auth read: waiting for that line keeps the case deterministic and pins
+				// that nothing is spent.
+				waitForLog(t, fake, reasonAuthUnreadable)
+			} else if got := fake.authGetCalls(); len(got) != 0 {
+				t.Errorf("auth.get calls = %v, want none", got)
 			}
 			if got := fake.requestCount(); got != 0 {
 				t.Errorf("http.do calls = %d, want none", got)
-			}
-			if got := fake.authGetCalls(); len(got) != 0 {
-				t.Errorf("auth.get calls = %v, want none", got)
 			}
 		})
 	}
@@ -456,7 +456,7 @@ func TestDecisionLogNamesItsSources(t *testing.T) {
 			if entry.Fields["resets_source"] != test.wantResets {
 				t.Errorf("resets_source = %v, want %q", entry.Fields["resets_source"], test.wantResets)
 			}
-			waitForLog(t, fake, reasonManagementKeyEmpty)
+			waitForLog(t, fake, reasonAuthUnreadable)
 		})
 	}
 }

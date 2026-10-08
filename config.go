@@ -2,16 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	pluginID = "cpa-plugin-codex-auto-reset"
-
-	defaultManagementBaseURL = "http://127.0.0.1:8317"
-)
+const pluginID = "cpa-plugin-codex-auto-reset"
 
 // lifecycleRequest is the register/reconfigure payload; ConfigYAML arrives base64
 // encoded because it is a []byte (D8).
@@ -24,16 +19,13 @@ type lifecycleRequest struct {
 type pluginConfig struct {
 	Enabled            bool     `yaml:"enabled"`
 	IncludeCredentials []string `yaml:"include_credentials"`
-	ManagementKey      string   `yaml:"management_key"`
-	ManagementBaseURL  string   `yaml:"management_base_url"`
 }
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
 		// The host always writes `enabled`, so a missing key means defaults apply,
 		// not that the plugin is off.
-		Enabled:           true,
-		ManagementBaseURL: defaultManagementBaseURL,
+		Enabled: true,
 	}
 }
 
@@ -83,10 +75,6 @@ func decodeConfig(h host, request []byte) pluginConfig {
 	if errUnmarshal := yaml.Unmarshal(req.ConfigYAML, &cfg); errUnmarshal != nil {
 		h.log(levelWarn, "invalid config yaml, using default config: "+errUnmarshal.Error(), logFields(nil))
 		return defaultConfig()
-	}
-	cfg.ManagementBaseURL = strings.TrimSpace(cfg.ManagementBaseURL)
-	if cfg.ManagementBaseURL == "" {
-		cfg.ManagementBaseURL = defaultManagementBaseURL
 	}
 	return cfg
 }

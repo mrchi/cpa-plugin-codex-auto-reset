@@ -96,7 +96,7 @@ func TestEmptyIncludeListWarns(t *testing.T) {
 func TestRegisterDisabledIgnoresExhaustion(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := newFakeHost()
-	registerConfig(t, fake, "enabled: false\nmanagement_key: secret-key\n")
+	registerConfig(t, fake, "enabled: false\n")
 
 	sendUsage(t, fake, hitRecord())
 
@@ -120,31 +120,31 @@ func TestIncludeCredentialsGatesMatchingCredential(t *testing.T) {
 	}{
 		{
 			name:       "included by auth id",
-			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - codex-a@example.com.json\n",
+			configYAML: "enabled: true\ninclude_credentials:\n  - codex-a@example.com.json\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
 		{
 			name:       "included by auth file name",
-			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - codex-a@example.com.json\n",
+			configYAML: "enabled: true\ninclude_credentials:\n  - codex-a@example.com.json\n",
 			authID:     "codex/codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
 		{
 			name:       "included by auth index",
-			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - c1f0a9\n",
+			configYAML: "enabled: true\ninclude_credentials:\n  - c1f0a9\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonHit,
 		},
 		{
 			name:       "a blank entry includes nothing",
-			configYAML: "enabled: true\nmanagement_key: secret-key\ninclude_credentials:\n  - \"  \"\n",
+			configYAML: "enabled: true\ninclude_credentials:\n  - \"  \"\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonNotIncluded,
 		},
 		{
 			name:       "an absent list includes nothing",
-			configYAML: "enabled: true\nmanagement_key: secret-key\n",
+			configYAML: "enabled: true\n",
 			authID:     "codex-a@example.com.json",
 			wantReason: reasonNotIncluded,
 		},
@@ -177,36 +177,21 @@ func TestIncludeCredentialsGatesMatchingCredential(t *testing.T) {
 	}
 }
 
-// TestConfiguredManagementEndpointIsUsed covers management_key and
-// management_base_url: both must reach the cooldown-clear request.
-func TestConfiguredManagementEndpointIsUsed(t *testing.T) {
+// TestConfiguredConfigIgnoresRemovedKeys covers the ADR-0006 breaking change: the keys
+// that used to configure the management endpoint are no longer read, so a leftover
+// config from 0.2.x cannot affect the flow.
+func TestConfiguredConfigIgnoresRemovedKeys(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-	configuredURL := "http://127.0.0.1:9000"
-	fake.script(http.MethodPost, configuredURL+managementResetQuotaPath, http.StatusOK, `{"status":"ok"}`)
-	registerConfig(t, fake, managementConfigYAML+"management_base_url: "+configuredURL+"/\n")
+	registerConfig(t, fake, includedConfigYAML+
+		"management_key: secret-key\nmanagement_base_url: http://127.0.0.1:9000\n")
 
 	sendUsage(t, fake, hitRecord())
 	waitForLog(t, fake, reasonCooldownCleared)
 
-	quota := fake.requestsFor(http.MethodPost, configuredURL+managementResetQuotaPath)
-	if len(quota) != 1 {
-		t.Fatalf("cooldown-clear requests to the configured endpoint = %d, want one", len(quota))
-	}
-	assertHeader(t, quota[0], "Authorization", "Bearer secret-key")
-}
-
-// TestBlankManagementBaseURLFallsBackToDefault covers the documented default.
-func TestBlankManagementBaseURLFallsBackToDefault(t *testing.T) {
-	useFakeClock(t, testClock)
-	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-	registerConfig(t, fake, managementConfigYAML+"management_base_url: \"  \"\n")
-
-	sendUsage(t, fake, hitRecord())
-	waitForLog(t, fake, reasonCooldownCleared)
-
-	if got := fake.requestsFor(http.MethodPost, quotaURL); len(got) != 1 {
-		t.Fatalf("cooldown-clear requests to the default endpoint = %d, want one", len(got))
+	assertUpstreamCalls(t, fake, 2)
+	if got := fake.cooldownsCleared(); len(got) != 1 || got[0] != authIndex {
+		t.Errorf("cooldown clears = %v, want one through the host RPC", got)
 	}
 }
 
@@ -225,7 +210,7 @@ func TestInvalidConfigWarnsAndKeepsTheDefaults(t *testing.T) {
 		{
 			name: "an unparsable config document",
 			payload: func(t *testing.T) []byte {
-				return lifecyclePayload(t, "enabled: false\nmanagement_key: [unterminated\n")
+				return lifecyclePayload(t, "enabled: false\n[unterminated\n")
 			},
 		},
 	}

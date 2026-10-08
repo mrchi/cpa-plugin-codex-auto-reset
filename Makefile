@@ -16,8 +16,10 @@ build:
 vet:
 	go vet ./...
 
+# -race is not optional here: the reset flow runs on its own goroutine and reads
+# process-wide state, so a missing lock only shows up under it.
 test:
-	CGO_ENABLED=1 go test ./...
+	CGO_ENABLED=1 go test -race ./...
 
 # print-version exposes the derivation to CI, so the tag check reads it from the same
 # place the archive name does instead of parsing main.go a second time.

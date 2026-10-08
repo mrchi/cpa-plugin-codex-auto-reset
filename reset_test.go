@@ -19,6 +19,10 @@ import (
 // errFakeTransport stands in for a host.http.do transport failure.
 var errFakeTransport = errors.New("fake transport failure")
 
+// errFakeCooldown stands in for a host that cannot clear the credential's cooldown:
+// below CPA v8.0.12 the RPC does not exist, and a host-side reset can fail too.
+var errFakeCooldown = errors.New("fake cooldown reset failure")
+
 const (
 	authIndex   = "c1f0a9"
 	authFile    = "codex-a@example.com.json"
@@ -27,14 +31,10 @@ const (
 
 	creditsURL = codexBaseURL + resetCreditsPath
 	consumeURL = codexBaseURL + resetConsumePath
-	quotaURL   = defaultManagementBaseURL + managementResetQuotaPath
 
-	// includedConfigYAML enables the plugin and includes the hit credential, but carries
-	// no management key: a hit reaches the pre-flight and stops there. Cases that only
-	// need the classification gate use this; reset-flow cases use managementConfigYAML.
+	// includedConfigYAML enables the plugin and includes the hit credential: the
+	// configuration every reset-flow case runs with.
 	includedConfigYAML = "enabled: true\ninclude_credentials:\n  - " + authFile + "\n"
-	// managementConfigYAML adds the management key on top of the included credential.
-	managementConfigYAML = includedConfigYAML + "management_key: secret-key\n"
 )
 
 // aUsableCredit is the credit listing most cases start from: it expires well after
@@ -57,13 +57,13 @@ func creditsBody(credits string) string {
 }
 
 // scriptedResetHost is a fake host wired for one credential and a flow that can
-// succeed: an available credit, a consume answer and a cooldown-clear answer.
+// succeed: an available credit and a consume answer, with the cooldown clear answering
+// successfully by default.
 func scriptedResetHost(credits string, consumeStatus int, consumeCode string) *fakeHost {
 	return newFakeHost().
 		withCredential(authIndex, `{"access_token":"`+accessToken+`","account_id":"`+accountID+`"}`).
 		script(http.MethodGet, creditsURL, http.StatusOK, creditsBody(credits)).
-		script(http.MethodPost, consumeURL, consumeStatus, `{"code":"`+consumeCode+`"}`).
-		script(http.MethodPost, quotaURL, http.StatusOK, `{"status":"ok"}`)
+		script(http.MethodPost, consumeURL, consumeStatus, `{"code":"`+consumeCode+`"}`)
 }
 
 // driveHit registers the configuration, sends one exhaustioned signal, and waits for
@@ -131,7 +131,7 @@ func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
 		{"id":"earliest","status":"available","expires_at":"2026-07-05T00:00:00Z"},
 		{"id":"forever","status":"available","expires_at":null}`, http.StatusOK, consumeCodeReset)
 
-	driveHit(t, fake, managementConfigYAML, reasonCooldownCleared, hitRecord())
+	driveHit(t, fake, includedConfigYAML, reasonCooldownCleared, hitRecord())
 
 	// The whole flow, in order: read the credential, list the credits, consume one,
 	// clear CPA's cooldown.
@@ -139,7 +139,7 @@ func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
 		"auth.get " + authIndex,
 		"http.do GET " + creditsURL,
 		"http.do POST " + consumeURL,
-		"http.do POST " + quotaURL,
+		"reset_cooldown " + authIndex,
 	}
 	if trace := fake.callTrace(); !reflect.DeepEqual(trace, want) {
 		t.Fatalf("call trace = %v, want %v", trace, want)
@@ -162,18 +162,9 @@ func TestResetFlowConsumesEarliestCreditAndClearsCooldown(t *testing.T) {
 		t.Errorf("consume credit_id = %q, want the earliest-expiring available credit", redeem.CreditID)
 	}
 
-	quota := fake.requestsFor(http.MethodPost, quotaURL)
-	if len(quota) != 1 {
-		t.Fatalf("cooldown-clear requests = %d, want one", len(quota))
-	}
-	assertHeader(t, quota[0], "Authorization", "Bearer secret-key")
-	assertHeader(t, quota[0], "Content-Type", "application/json")
-	var resetQuota managementResetQuotaRequest
-	if errUnmarshal := json.Unmarshal(quota[0].Body, &resetQuota); errUnmarshal != nil {
-		t.Fatalf("decode reset-quota body %s: %v", quota[0].Body, errUnmarshal)
-	}
-	if resetQuota.AuthIndex != authIndex {
-		t.Errorf("reset-quota auth_index = %q, want the runtime auth index", resetQuota.AuthIndex)
+	cleared := fake.cooldownsCleared()
+	if len(cleared) != 1 || cleared[0] != authIndex {
+		t.Errorf("cooldown clears = %v, want exactly one for the runtime auth index", cleared)
 	}
 
 	logs := fake.logged()
@@ -267,15 +258,13 @@ func TestResetCreditSelection(t *testing.T) {
 			if test.wantCredit != "" {
 				lastLog = reasonCooldownCleared
 			}
-			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
+			driveHit(t, fake, includedConfigYAML, lastLog, hitRecord())
 
 			wantCalls := 1 // the listing
 			if test.wantCredit != "" {
-				wantCalls = 3 // plus the consume and the cooldown clear
+				wantCalls = 2 // plus the consume
 			}
-			if got := fake.requestCount(); got != wantCalls {
-				t.Fatalf("http.do calls = %d, want %d", got, wantCalls)
-			}
+			assertUpstreamCalls(t, fake, wantCalls)
 			if test.wantCredit == "" {
 				if got := logsWithMessage(fake.logged(), reasonNoAvailableCredit); len(got) != 1 {
 					t.Errorf("no-credit logs = %+v, want one", got)
@@ -357,7 +346,7 @@ func TestResetCredentialHeaderFallbacks(t *testing.T) {
 			if test.wantAnyRequest {
 				lastLog = reasonCooldownCleared
 			}
-			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
+			driveHit(t, fake, includedConfigYAML, lastLog, hitRecord())
 
 			listing := fake.requestsFor(http.MethodGet, creditsURL)
 			if !test.wantAnyRequest {
@@ -409,15 +398,10 @@ func TestResetConsumeOutcomes(t *testing.T) {
 			if test.wantCooldown {
 				lastLog = reasonCooldownCleared
 			}
-			driveHit(t, fake, managementConfigYAML, lastLog, hitRecord())
+			driveHit(t, fake, includedConfigYAML, lastLog, hitRecord())
 
-			wantCalls := 2 // the listing and the consume
-			if test.wantCooldown {
-				wantCalls = 3 // plus the cooldown clear
-			}
-			if got := fake.requestCount(); got != wantCalls {
-				t.Fatalf("http.do calls = %d, want %d", got, wantCalls)
-			}
+			// Every case here reaches a consume: the listing plus that consume.
+			assertUpstreamCalls(t, fake, 2)
 			redeem := consumedCredit(t, fake)
 			if redeem.CreditID != "credit-1" {
 				t.Errorf("consume credit_id = %q, want credit-1", redeem.CreditID)
@@ -431,6 +415,9 @@ func TestResetConsumeOutcomes(t *testing.T) {
 			if !test.wantCooldown {
 				if len(cleared) != 0 {
 					t.Errorf("cooldown cleared for a failure: %+v", cleared)
+				}
+				if got := fake.cooldownsCleared(); len(got) != 0 {
+					t.Errorf("cooldown clears = %v, want none after a failed consume", got)
 				}
 				if got := logsWithMessage(logs, reasonConsumeFailed); len(got) != 1 {
 					t.Fatalf("consume-failure logs = %+v, want one", got)
@@ -470,7 +457,7 @@ func TestResetListingFailures(t *testing.T) {
 				fake.script(http.MethodGet, creditsURL, test.status, test.body)
 			}
 
-			driveHit(t, fake, managementConfigYAML, reasonCreditsListFailed, hitRecord())
+			driveHit(t, fake, includedConfigYAML, reasonCreditsListFailed, hitRecord())
 
 			if got := fake.requestCount(); got != test.wantCalls {
 				t.Fatalf("http.do calls = %d, want %d listing attempts and nothing else", got, test.wantCalls)
@@ -499,7 +486,7 @@ func TestResetListingRecoversOnRetry(t *testing.T) {
 		return fake.answer(request)
 	}
 
-	driveHit(t, fake, managementConfigYAML, reasonCooldownCleared, hitRecord())
+	driveHit(t, fake, includedConfigYAML, reasonCooldownCleared, hitRecord())
 
 	if got := len(fake.requestsFor(http.MethodGet, creditsURL)); got != 2 {
 		t.Errorf("listing requests = %d, want the failed one and one retry", got)
@@ -509,9 +496,10 @@ func TestResetListingRecoversOnRetry(t *testing.T) {
 
 // TestFlowOutcomeDecidesSuppression pins which finished flows silence the credential
 // for the suppression window. A flow whose outcome a quick repeat cannot change (a
-// credit spent, none to spend, a dead token, a consume already sent) is suppressed, so
-// the stale 429 records that keep arriving do not repeat the upstream calls. A flow
-// that stopped on a transient fault stays eligible for the next signal.
+// credit spent, none to spend, a dead token, a consume already sent, a listing that is
+// still failing after its retries) is suppressed, so the stale 429 records that keep
+// arriving do not repeat the upstream calls. Only a flow stopped before it could reach
+// upstream (the credential itself being unreadable) stays eligible for the next signal.
 func TestFlowOutcomeDecidesSuppression(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -550,9 +538,10 @@ func TestFlowOutcomeDecidesSuppression(t *testing.T) {
 			wantSuppressed: true,
 		},
 		{
-			name:    "listing keeps failing",
-			arrange: func(f *fakeHost) { f.scriptFailure(http.MethodGet, creditsURL, errFakeTransport) },
-			lastLog: reasonCreditsListFailed,
+			name:           "listing keeps failing",
+			arrange:        func(f *fakeHost) { f.scriptFailure(http.MethodGet, creditsURL, errFakeTransport) },
+			lastLog:        reasonCreditsListFailed,
+			wantSuppressed: true,
 		},
 		{
 			name:    "credential cannot be read",
@@ -566,7 +555,7 @@ func TestFlowOutcomeDecidesSuppression(t *testing.T) {
 			useFakeClock(t, testClock)
 			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
 			test.arrange(fake)
-			driveHit(t, fake, managementConfigYAML, test.lastLog, hitRecord())
+			driveHit(t, fake, includedConfigYAML, test.lastLog, hitRecord())
 
 			if test.wantSuppressed {
 				waitForSuppressed(t, fake, hitRecord())
@@ -598,7 +587,7 @@ func TestBlankAuthIndexNeverStartsAFlow(t *testing.T) {
 	record := hitRecord()
 	record.AuthIndex = ""
 
-	driveHit(t, fake, managementConfigYAML, reasonNoAuthIndex, record)
+	driveHit(t, fake, includedConfigYAML, reasonNoAuthIndex, record)
 
 	if got := len(fake.authGetCalls()); got != 0 {
 		t.Errorf("auth.get calls = %d, want none", got)
@@ -612,7 +601,7 @@ func TestResetWithoutACredentialAborts(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := newFakeHost().script(http.MethodGet, creditsURL, http.StatusOK, creditsBody(aUsableCredit))
 
-	driveHit(t, fake, managementConfigYAML, reasonAuthUnreadable, hitRecord())
+	driveHit(t, fake, includedConfigYAML, reasonAuthUnreadable, hitRecord())
 
 	if got := fake.requestCount(); got != 0 {
 		t.Errorf("http.do calls = %d, want none", got)
@@ -622,59 +611,27 @@ func TestResetWithoutACredentialAborts(t *testing.T) {
 	}
 }
 
+// TestCooldownClearFailureIsLoggedAndNeverRetried pins the failure path of the host RPC:
+// a host below v8.0.12 reports unknown_method and a host-side reset can fail too, and
+// either way the credit is already spent. The flow logs once, ends, and never retries.
 func TestCooldownClearFailureIsLoggedAndNeverRetried(t *testing.T) {
-	tests := []struct {
-		name      string
-		transport bool
-	}{
-		{name: "a non-200 response"},
-		{name: "a transport error", transport: true},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			useFakeClock(t, testClock)
-			fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-			if test.transport {
-				fake.scriptFailure(http.MethodPost, quotaURL, errFakeTransport)
-			} else {
-				fake.script(http.MethodPost, quotaURL, http.StatusInternalServerError, `{"error":"boom"}`)
-			}
-
-			driveHit(t, fake, managementConfigYAML, reasonCooldownFailed, hitRecord())
-
-			if got := fake.requestCount(); got != 3 {
-				t.Fatalf("http.do calls = %d, want exactly one cooldown attempt", got)
-			}
-			logs := fake.logged()
-			if got := logsWithMessage(logs, reasonResetSucceeded); len(got) != 1 {
-				t.Errorf("success logs = %+v, want one", got)
-			}
-			if got := logsWithMessage(logs, reasonCooldownFailed); len(got) != 1 {
-				t.Errorf("cooldown-failure logs = %+v, want one in %+v", got, logs)
-			}
-		})
-	}
-}
-
-// TestMissingManagementKeyConsumesNothing pins the fail-safe: without a management key
-// the cooldown can never be cleared, so spending a credit would leave the credential
-// locked until the old reset time and burn the credit for nothing — worse than the
-// plugin being absent (spec story 16). The flow must stop before touching upstream.
-func TestMissingManagementKeyConsumesNothing(t *testing.T) {
 	useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
+	fake.failCooldown(errFakeCooldown)
 
-	driveHit(t, fake, includedConfigYAML, reasonManagementKeyEmpty, hitRecord())
+	driveHit(t, fake, includedConfigYAML, reasonCooldownFailed, hitRecord())
 
-	if got := fake.requestCount(); got != 0 {
-		t.Fatalf("http.do calls = %v, want none: the credit must not be spent", fake.callTrace())
+	// The listing and the consume only.
+	assertUpstreamCalls(t, fake, 2)
+	if got := fake.cooldownsCleared(); len(got) != 1 {
+		t.Fatalf("cooldown clears = %v, want exactly one attempt", got)
 	}
-	if got := len(fake.authGetCalls()); got != 0 {
-		t.Errorf("auth.get calls = %d, want none", got)
+	logs := fake.logged()
+	if got := logsWithMessage(logs, reasonResetSucceeded); len(got) != 1 {
+		t.Errorf("success logs = %+v, want one", got)
 	}
-	if got := logsWithMessage(fake.logged(), reasonManagementKeyEmpty); len(got) != 1 {
-		t.Errorf("management-key logs = %+v, want one", got)
+	if got := logsWithMessage(logs, reasonCooldownFailed); len(got) != 1 {
+		t.Errorf("cooldown-failure logs = %+v, want one in %+v", got, logs)
 	}
 }
 
@@ -687,7 +644,7 @@ func TestIdempotencyKeyIsGeneratedPerFlow(t *testing.T) {
 	keys := make([]string, 0, 2)
 	for _, index := range []string{authIndex, "b2e1c8"} {
 		fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-		registerConfig(t, fake, managementConfigYAML)
+		registerConfig(t, fake, includedConfigYAML)
 		fake.withCredential(index, `{"access_token":"`+accessToken+`","account_id":"`+accountID+`"}`)
 		record := hitRecord()
 		record.AuthIndex = index
@@ -715,7 +672,7 @@ func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
 		}
 		return fake.answer(request)
 	}
-	registerConfig(t, fake, managementConfigYAML)
+	registerConfig(t, fake, includedConfigYAML)
 
 	record := hitRecord()
 	payload := marshalRecord(t, record)
@@ -748,14 +705,13 @@ func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
 	}
 
 	close(released)
-	waitFor(t, func() bool { return fake.requestCount() == 3 })
+	waitFor(t, func() bool { return fake.requestCount() == 2 })
 	if got := len(fake.authGetCalls()); got != 1 {
 		t.Errorf("auth.get calls = %d, want 1", got)
 	}
 	want := []string{
 		"http.do GET " + creditsURL,
 		"http.do POST " + consumeURL,
-		"http.do POST " + quotaURL,
 	}
 	var trace []string
 	for _, entry := range fake.callTrace() {
@@ -774,15 +730,15 @@ func TestUsageHandleDispatchesOnceAndReturnsImmediately(t *testing.T) {
 func TestResetSuppressionBlocksRetriggerWithinFiveMinutes(t *testing.T) {
 	clock := useFakeClock(t, testClock)
 	fake := scriptedResetHost(aUsableCredit, http.StatusOK, consumeCodeReset)
-	registerConfig(t, fake, managementConfigYAML)
+	registerConfig(t, fake, includedConfigYAML)
 
 	sendUsage(t, fake, hitRecord())
 	waitForLog(t, fake, reasonCooldownCleared)
 	// Probe until the flow has released its slot and the suppression window applies.
 	waitForSuppressed(t, fake, hitRecord())
 	afterFirstFlow := fake.requestCount()
-	if afterFirstFlow != 3 {
-		t.Fatalf("http.do calls after the first flow = %d, want 3", afterFirstFlow)
+	if afterFirstFlow != 2 {
+		t.Fatalf("http.do calls after the first flow = %d, want 2", afterFirstFlow)
 	}
 
 	clock.advance(time.Minute)
@@ -801,7 +757,7 @@ func TestResetSuppressionBlocksRetriggerWithinFiveMinutes(t *testing.T) {
 	// Past the window the credential is eligible again and spends a second credit.
 	clock.advance(resetSuppressWindow)
 	sendUsage(t, fake, hitRecord())
-	waitFor(t, func() bool { return fake.requestCount() == 6 })
+	waitFor(t, func() bool { return fake.requestCount() == 4 })
 	if got := logsWithMessage(fake.logged(), reasonCooldownCleared); len(got) != 2 {
 		t.Errorf("cooldown-clear logs = %d, want a second flow after the window", len(got))
 	}
@@ -819,7 +775,7 @@ func TestConcurrentSignalsStartOneFlow(t *testing.T) {
 		}
 		return fake.answer(request)
 	}
-	registerConfig(t, fake, managementConfigYAML)
+	registerConfig(t, fake, includedConfigYAML)
 
 	const signals = 64
 	payload := marshalRecord(t, hitRecord())
@@ -839,7 +795,7 @@ func TestConcurrentSignalsStartOneFlow(t *testing.T) {
 		t.Errorf("in-flight drops = %d, want %d", got, signals-1)
 	}
 	close(released)
-	waitFor(t, func() bool { return fake.requestCount() == 3 })
+	waitFor(t, func() bool { return fake.requestCount() == 2 })
 	if got := len(fake.authGetCalls()); got != 1 {
 		t.Errorf("auth.get calls = %d, want exactly one flow", got)
 	}
